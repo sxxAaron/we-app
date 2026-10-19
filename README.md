@@ -1,0 +1,146 @@
+# we-app · 一起，轻一点
+
+两个人使用的 100 天体重记录网站。手机填写体重和备注，对方登录后查看趋势、留言鼓励。数据存进自己的服务器，不依赖第三方应用账号、外部字体、CDN 或统计服务。
+
+## 已实现
+
+- 记录者账号：按天填写、补记、修改或删除体重，调整计划开始日期和可选目标体重。
+- 陪伴者账号：查看体重、曲线和记录；不能修改体重或计划。双方都可以留言和修改自己的密码。
+- 7 天、30 天、全部曲线；100 天记录日历；按月份查看；CSV 导出。
+- 默认计划：2026-10-19 至 2027-01-26，共 100 天，沿用原 Excel。初始体重为空，没有导入或编造任何实际体重。
+- 页面打开时每 15 秒检查更新；重新切回页面时同步。编辑期间暂停自动刷新，避免覆盖未保存内容。并发修改同一天的记录时检测冲突。
+- SQLite 持久化；每小时生成/更新当天一致性备份，保留最近 14 个备份日；记录者可下载包括留言的 JSON 数据备份。
+- 登录密码使用随机盐和 PBKDF2-SHA256（600,000 次）；会话使用 HttpOnly、SameSite Cookie；写操作带 CSRF 验证；登录限速；双账号访问控制。
+- `/?demo=1` 是独立的示例界面，示例体重和留言不会写入数据库，也不会访问实际记录。
+
+## Linux + Docker 部署
+
+需要 Docker Engine、Docker Compose 插件。以下所有命令都在项目根目录执行。初始配置工具需要 Python 3.11+；如果服务器没有 Python，可用后面的 Docker 替代命令。
+
+### 方案 A：已有 Nginx / 宝塔 / 1Panel 等 HTTPS 反向代理
+
+1. 将代码克隆到服务器，进入项目目录：
+
+```bash
+git clone https://github.com/sxxAaron/we-app.git
+cd we-app
+```
+2. 生成配置，把示例域名换成你自己的域名：
+
+```bash
+python3 manage.py init-env --domain weight.example.com
+docker compose up -d --build
+```
+
+应用只监听服务器本机 `127.0.0.1:18765`。在已有 HTTPS 站点中，将请求反向代理到 `http://127.0.0.1:18765`，并保留原始 Host 头。可参考 `nginx.example.conf`。如果代理自身运行在容器中，应通过共享 Docker 网络连接 app，而不是在代理容器中访问 127.0.0.1。
+
+### 方案 B：服务器没有占用 80/443，使用 Caddy 自动 HTTPS
+
+先把域名的 A / AAAA 解析正确指向服务器，开放 TCP 80/443。已有站点正在占用这些端口时请使用方案 A。
+
+```bash
+python3 manage.py init-env --domain weight.example.com
+docker compose -f compose.yaml -f compose.https.yaml up -d --build
+```
+
+访问 `https://weight.example.com`。Caddy 的证书签发与续期需要服务器可正常访问证书服务，域名解析正确，端口可从公网访问。
+
+### 没有宿主机 Python 时
+
+用官方 Python 容器生成配置，然后再执行对应方案的启动命令：
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/project" -w /project python:3.13-slim python manage.py init-env --domain weight.example.com
+```
+
+### 首次打开与两个账号
+
+在你自己的服务器终端查看初始化密钥：
+
+```bash
+docker compose exec app python manage.py setup-token
+```
+
+在网站初始化页面输入该密钥，设置两个账号、昵称和密码：记录者能修改体重，陪伴者能查看与留言。账号使用 3～32 位字母、数字、点、横线、下划线；密码至少 10 个字符。初始化密钥不是登录密码；初始化完成后无法通过它重复创建账号或查看数据。
+
+使用 Caddy 方案时，对运行中容器执行管理命令仍可用 `docker compose exec app ...`。查看整个部署或停止时则要带上两个 `-f` 参数。
+
+**不要提交 `.env`、数据库和备份到 Git 仓库。** 账号密码由你初始化时自行设置，源码没有默认登录密码。
+
+### 只有 IP、暂时没有域名
+
+可以先通过 SSH 隧道在自己电脑上测试。临时将 `.env` 中 `COOKIE_SECURE=false`，清空 `PUBLIC_ORIGIN`，重建应用容器；本机执行：
+
+```bash
+ssh -L 18765:127.0.0.1:18765 your-user@your-server
+```
+
+本机浏览器访问 `http://127.0.0.1:18765`。此方式仅供本机测试，应用端口仍只绑定服务器回环地址。给双方长期使用时，请配置 HTTPS 并恢复 `COOKIE_SECURE=true` 与正确 `PUBLIC_ORIGIN`，重新创建容器。是否需要备案取决于服务器所在地及接入服务商要求，按实际部署环境办理。
+
+## 更新和运维
+
+```bash
+git pull
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=100 app
+```
+
+Caddy 部署的启动/更新命令请始终带上 `-f compose.yaml -f compose.https.yaml`。数据使用 Docker 命名卷保存，更新镜像不会清空数据。**不要运行 `docker compose down -v`，它会删除数据卷。**
+
+### 手动备份与恢复
+
+```bash
+docker compose exec app python manage.py backup
+docker compose cp app:/data/backups ./backups
+```
+
+自动备份与数据库在同一服务器，服务器或磁盘故障会一起丢失，因此请定期把 `backups` 复制到其他设备。SQLite 备份包括密码哈希和会话信息，应像账号资料一样保管。网页中的 JSON 备份不含密码或会话，适合保留记录和留言，但没有提供网页导入恢复功能。
+
+恢复 SQLite 备份时，先停止整个部署，把备份上传为项目目录下的 `restore.sqlite3`。以下命令会覆盖数据库，请先另存当前数据库；确认所选备份正确后再执行：
+
+```bash
+docker compose stop
+docker compose run --rm --no-deps -v "$PWD/restore.sqlite3:/restore.sqlite3:ro" app python -c 'import sqlite3; source=sqlite3.connect("/restore.sqlite3"); dest=sqlite3.connect("/data/journal.db"); source.backup(dest); dest.execute("DELETE FROM sessions"); dest.commit(); source.close(); dest.close()'
+docker compose up -d
+```
+
+Caddy 方案的 stop/up 命令同样需要带两个 `-f` 参数。备份文件需要容器 UID 10001 可读。恢复后双方重新登录。数据目录和备份文件不要放在可公开访问的站点目录。
+
+### 忘记密码
+
+在自己的服务器终端执行（新密码通过隐藏输入提示录入，不出现在命令参数中）：
+
+```bash
+docker compose exec app python manage.py reset-password your-username
+```
+
+### 不使用 Docker 的本地运行
+
+Python 3.11+，无需 pip 安装依赖：
+
+```bash
+python3 manage.py init-env
+```
+
+把本地 `.env` 的 `COOKIE_SECURE` 改成 `false`，保留 `HOST=127.0.0.1` 和空的 `PUBLIC_ORIGIN`，然后：
+
+```bash
+python3 server.py
+```
+
+浏览器访问 `http://127.0.0.1:8080`。生产环境使用 Docker 与 HTTPS 反向代理，不要把调试端口直接公开。
+
+## 验证
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+测试使用隔离临时数据库，覆盖初始化、登录、跨账号权限、留言共享、持久化、并发冲突、日期和空值校验、CSRF、CSV 注入防护、密码修改和 SQLite 备份。
+
+## 结构
+
+`server.py`：HTTP API、身份与权限、SQLite、备份。`static/`：无构建依赖的响应式界面。`manage.py`：部署配置、备份和密码恢复。整个应用运行时仅需 Python 标准库。Docker 基础镜像与 Caddy 镜像首次部署时需要从镜像仓库拉取。
+
+参考：[Docker Compose 安装](https://docs.docker.com/compose/install/)、[Caddy 自动 HTTPS](https://caddyserver.com/docs/automatic-https)、[Python SQLite 备份 API](https://docs.python.org/3.13/library/sqlite3.html#sqlite3.Connection.backup)。
