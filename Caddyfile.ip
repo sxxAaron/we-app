@@ -1,0 +1,17 @@
+# A public IPv4 is required. Caddy's explicit ACME issuer requests a publicly
+# trusted certificate; this does not use Caddy's local/self-signed CA.
+{
+	# Browsers may omit SNI for IP URLs. Use the public IP rather than the
+	# Docker container's private address when selecting the certificate.
+	default_sni {$SERVER_IP}
+}
+
+https://{$SERVER_IP} {
+	tls {
+		issuer acme https://acme-v02.api.letsencrypt.org/directory {
+			profile shortlived
+		}
+	}
+	encode zstd gzip
+	reverse_proxy app:8080
+}

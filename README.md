@@ -17,6 +17,8 @@
 
 需要 Docker Engine、Docker Compose 插件。以下所有命令都在项目根目录执行。初始配置工具需要 Python 3.11+；如果服务器没有 Python，可用后面的 Docker 替代命令。
 
+已有其他网站占用 80/443、只想先在新端口试用时，可直接看“方案 D”。HTTPS 方案与 HTTP 试用方案不要混用。
+
 ### 方案 A：已有 Nginx / 宝塔 / 1Panel 等 HTTPS 反向代理
 
 1. 将代码克隆到服务器，进入项目目录：
@@ -32,7 +34,7 @@ python3 manage.py init-env --domain weight.example.com
 docker compose up -d --build
 ```
 
-应用只监听服务器本机 `127.0.0.1:18765`。在已有 HTTPS 站点中，将请求反向代理到 `http://127.0.0.1:18765`，并保留原始 Host 头。可参考 `nginx.example.conf`。如果代理自身运行在容器中，应通过共享 Docker 网络连接 app，而不是在代理容器中访问 127.0.0.1。
+此默认 HTTPS 代理方案中，应用只监听服务器本机 `127.0.0.1:18765`。在已有 HTTPS 站点中，将请求反向代理到 `http://127.0.0.1:18765`，并保留原始 Host 头。可参考 `nginx.example.conf`。如果代理自身运行在容器中，应通过共享 Docker 网络连接 app，而不是在代理容器中访问 127.0.0.1。
 
 ### 方案 B：服务器没有占用 80/443，使用 Caddy 自动 HTTPS
 
@@ -67,15 +69,82 @@ docker compose exec app python manage.py setup-token
 
 **不要提交 `.env`、数据库和备份到 Git 仓库。** 账号密码由你初始化时自行设置，源码没有默认登录密码。
 
-### 只有 IP、暂时没有域名
+### 方案 C：没有域名，用公网 IPv4 + HTTPS
 
-可以先通过 SSH 隧道在自己电脑上测试。临时将 `.env` 中 `COOKIE_SECURE=false`，清空 `PUBLIC_ORIGIN`，重建应用容器；本机执行：
+不需要先买域名。此方案通过 Caddy 2.11.7 和 Let’s Encrypt 的 `shortlived` 证书配置，为公网 IPv4 申请受浏览器信任的 HTTPS 证书；Caddy 自动续期，保留加密登录和 Secure Cookie。IP 必须是你控制的服务器公网 IPv4，不能填内网、回环或文档示例地址。当前配置只覆盖 IPv4。
+
+前提：服务器 TCP 80/443 可从公网访问，而且这两个端口没有被其他站点占用。这里指公网对应的标准端口；如果服务商做了端口映射，需要把公网的 80/443 映射到此部署。应用自身的 18765 端口保持只监听本机，不需要开放。
+
+第一次部署，在服务器执行（将“你的公网IPv4”替换为实际 IP）：
 
 ```bash
-ssh -L 18765:127.0.0.1:18765 your-user@your-server
+git clone https://github.com/sxxAaron/we-app.git
+cd we-app
+python3 manage.py init-env --ip 你的公网IPv4
+docker compose -f compose.yaml -f compose.ip.yaml up -d --build
 ```
 
-本机浏览器访问 `http://127.0.0.1:18765`。此方式仅供本机测试，应用端口仍只绑定服务器回环地址。给双方长期使用时，请配置 HTTPS 并恢复 `COOKIE_SECURE=true` 与正确 `PUBLIC_ORIGIN`，重新创建容器。是否需要备案取决于服务器所在地及接入服务商要求，按实际部署环境办理。
+如果已经克隆仓库，先在仓库目录执行 `git pull`，跳过 `git clone` 和 `cd`。没有 Python 3.11+ 时，用以下命令代替生成配置的那一行：
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/project" -w /project python:3.13-slim python manage.py init-env --ip 你的公网IPv4
+```
+
+若 `.env` 已存在，初始化工具不会覆盖它。保留原来的 `SETUP_TOKEN` 和数据库配置，手动设置以下三项即可：
+
+```dotenv
+SERVER_IP=你的公网IPv4
+PUBLIC_ORIGIN=https://你的公网IPv4
+COOKIE_SECURE=true
+```
+
+查看启动状态和证书签发进度：
+
+```bash
+docker compose -f compose.yaml -f compose.ip.yaml ps
+docker compose -f compose.yaml -f compose.ip.yaml logs --tail=100 caddy
+```
+
+等证书签发成功，再用手机打开 `https://你的公网IPv4`，然后查看初始化密钥，创建两个账号：
+
+```bash
+docker compose exec app python manage.py setup-token
+```
+
+签发必须通过证书机构从公网进行验证；如果失败，先检查 IP、端口、防火墙和现有服务占用。不要通过浏览器忽略证书错误来使用登录功能。签发与自动续期依赖证书机构网络可达、80/443 验证链路和 Caddy 数据卷正常保留。IP 变化后需要同步更新 `SERVER_IP` 和 `PUBLIC_ORIGIN`，重新创建容器。
+
+IP 证书目前有效期约六天，Caddy 会自动续期。请保留 Caddy 数据卷，并确保服务持续运行。此配置已通过本地 Caddy 适配检查，尚未在你的公网 IP 上实际签发证书，也未在此电脑运行 Docker 容器；这些步骤需要在服务器上验证。
+
+参考：[Let’s Encrypt 的 IP 证书公告](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability)、[Caddy ACME profile 配置](https://caddyserver.com/docs/caddyfile/directives/tls#issuers)。IP 访问是否受服务商的接入与备案要求限制，仍取决于服务器实际所在地和服务商规则，IP 不能用来绕过这些要求。
+
+只做本机测试时，也可使用 SSH 隧道。临时将本地/测试环境的 `.env` 设置为 `COOKIE_SECURE=false`、清空 `PUBLIC_ORIGIN`，在服务器启动基础 `compose.yaml`；自己的电脑执行 `ssh -L 18765:127.0.0.1:18765 your-user@your-server`，浏览器访问 `http://127.0.0.1:18765`。这条路径仅供本机验证，不能作为双方异地使用的入口。
+
+### 方案 D：指定新端口的 HTTP 试用，不调整原来的 Nginx
+
+适合已有网站占用 80/443、暂时没有域名、希望先看效果的情况。此方案独立使用指定的新端口，不停止 Nginx，也不修改现有站点。**HTTP 下账号密码、体重和留言的传输没有加密，只用于试用，请勿复用重要密码；正式使用应接入 HTTPS。**
+
+在服务器终端执行，将“你的公网IPv4”替换为真实地址，默认端口为 40039：
+
+```bash
+git clone https://github.com/sxxAaron/we-app.git
+cd we-app
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/project" -w /project python:3.13-slim python manage.py init-env --http-ip 你的公网IPv4 --port 40039
+docker compose up -d --build
+docker compose exec app python manage.py setup-token
+```
+
+如果已克隆代码，先在仓库目录执行 `git pull`，跳过前两行。生成配置时若已有 `.env`，工具会拒绝覆盖；请保留原来的 `SETUP_TOKEN`，手动设置以下四项后再运行 `docker compose up -d --build`：
+
+```dotenv
+PUBLIC_ORIGIN=http://你的公网IPv4:40039
+COOKIE_SECURE=false
+BIND_ADDRESS=0.0.0.0
+APP_PORT=40039
+```
+
+在服务器安全组和防火墙中允许 **TCP 40039**。浏览器打开 `http://你的公网IPv4:40039`，填入上一条管理命令显示的初始化密钥，设置两个账号。密钥只在你自己的终端查看，不要发到聊天或提交到仓库。
+
+已经初始化过的数据库会继续保留，修改端口不会清除体重记录。后续长期使用时，在现有 Nginx 配置 HTTPS 反代：将 `BIND_ADDRESS` 改回 `127.0.0.1`、`APP_PORT` 改回 `18765`、`COOKIE_SECURE` 改为 `true`、`PUBLIC_ORIGIN` 改成最终 HTTPS 地址，然后重新创建 app 容器。IP HTTPS 的证书验证仍需接入公网 80 或 443；40039 本身不能替代标准证书验证端口。
 
 ## 更新和运维
 
@@ -86,7 +155,7 @@ docker compose ps
 docker compose logs --tail=100 app
 ```
 
-Caddy 部署的启动/更新命令请始终带上 `-f compose.yaml -f compose.https.yaml`。数据使用 Docker 命名卷保存，更新镜像不会清空数据。**不要运行 `docker compose down -v`，它会删除数据卷。**
+有域名的 Caddy 部署请始终带上 `-f compose.yaml -f compose.https.yaml`；无域名的 IP HTTPS 部署请始终带上 `-f compose.yaml -f compose.ip.yaml`。不要把两个 Caddy 方案同时启动。数据使用 Docker 命名卷保存，更新镜像不会清空数据。HTTP 试用配置也使用同一数据卷。**不要运行 `docker compose down -v`，它会删除数据卷。**
 
 ### 手动备份与恢复
 
@@ -105,7 +174,7 @@ docker compose run --rm --no-deps -v "$PWD/restore.sqlite3:/restore.sqlite3:ro" 
 docker compose up -d
 ```
 
-Caddy 方案的 stop/up 命令同样需要带两个 `-f` 参数。备份文件需要容器 UID 10001 可读。恢复后双方重新登录。数据目录和备份文件不要放在可公开访问的站点目录。
+Caddy 方案的 stop/up 命令同样需要带对应的两个 `-f` 参数（域名用 `compose.https.yaml`，IP 用 `compose.ip.yaml`）。备份文件需要容器 UID 10001 可读。恢复后双方重新登录。数据目录和备份文件不要放在可公开访问的站点目录。
 
 ### 忘记密码
 
@@ -137,7 +206,7 @@ python3 server.py
 python3 -m unittest discover -s tests -v
 ```
 
-测试使用隔离临时数据库，覆盖初始化、登录、跨账号权限、留言共享、持久化、并发冲突、日期和空值校验、CSRF、CSV 注入防护、密码修改和 SQLite 备份。
+测试使用隔离临时数据库，覆盖初始化、登录、跨账号权限、留言共享、持久化、并发冲突、日期和空值校验、CSRF、CSV 注入防护、密码修改和 SQLite 备份；另有部署配置测试覆盖公网 IP 校验、安全默认值和配置防覆盖。
 
 ## 结构
 

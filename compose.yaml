@@ -11,7 +11,7 @@ services:
       PORT: 8080
       DB_PATH: /data/journal.db
     ports:
-      - "127.0.0.1:18765:8080"
+      - "${BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-18765}:8080"
     volumes:
       - journal-data:/data
     read_only: true
