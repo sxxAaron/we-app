@@ -8,21 +8,27 @@ const source = fs.readFileSync(path.join(__dirname, '../static/app.js'), 'utf8')
 function app() {
   const root = { innerHTML: '' };
   const log = { innerHTML: '', scrollTop: 100, scrollHeight: 900, clientHeight: 400 };
-  const text = { value: '', tagName: 'TEXTAREA', closest: s => s === '#comment-form' };
+  const text = { id: 'comment-text', value: '', tagName: 'TEXTAREA', closest: s => s === '#comment-form' };
   const status = { textContent: '', classList: { toggle() {}, add() {}, remove() {} } };
   const nodes = new Map([['#app', root], ['#message-list', log], ['#comment-text', text], ['#chat-count', {}], ['#sync-status', status], ['#record-dialog', { open: false, showModal() { this.open=true; }, close() { this.open=false; } }], ['#toast', status]]);
   const events = new Map();
+  const classes = new Set(), styles = new Map();
+  const html = {
+    clientWidth: 1200, clientHeight: 900,
+    classList: { toggle(name, force) { if (force) classes.add(name); else classes.delete(name); }, remove(name) { classes.delete(name); } },
+    style: { setProperty(name, value) { styles.set(name, value); }, removeProperty(name) { styles.delete(name); } }
+  };
   const context = vm.createContext({
     URLSearchParams, console, Map, JSON, Date, setTimeout: () => 0, clearTimeout() {}, setInterval() {},
-    document: { querySelector: s => nodes.get(s) || null, querySelectorAll: () => [], addEventListener: (name, callback) => events.set(name, callback), activeElement: { tagName: 'BODY' }, hidden: false },
-    location: { search: '' }, window: { scrollTo() {} },
+    document: { documentElement: html, querySelector: s => nodes.get(s) || null, querySelectorAll: () => [], addEventListener: (name, callback) => events.set(name, callback), activeElement: { tagName: 'BODY' }, hidden: false },
+    location: { search: '' }, window: { innerWidth: 1200, innerHeight: 900, matchMedia() { return { matches: this.innerWidth <= 900 }; }, addEventListener: (name, callback) => events.set('window:' + name, callback), scrollTo() {} },
     FormData: class { constructor(form) { return new Map(Object.entries(form.values)); } },
     fetch: async () => { throw Error('Unexpected real network request'); }
   });
   vm.runInContext(source, context);
   const run = code => vm.runInContext(code, context);
   run("state = demoState(); state.plan = extendedPlan(state.plan, state.today); demo = true;");
-  return { run, context, events, nodes, root, log, text };
+  return { run, context, events, nodes, root, log, text, classes, styles };
 }
 test('three primary tabs, history stays under home, and no home progress or chat', () => {
   const a = app();
@@ -312,4 +318,95 @@ test('overlapping read acknowledgements use a single request', async () => {
   await pending;
   assert.equal(a.run('markingRead'), false);
   assert.equal(a.run('state.chat.unread_count'), 0);
+});
+
+function phoneChat(a) {
+  const viewport = {height: 844, offsetTop: 0, scale: 1};
+  Object.assign(a.context.window, {innerWidth: 390, innerHeight: 844, visualViewport: viewport});
+  Object.assign(a.context.document.documentElement, {clientWidth: 390, clientHeight: 844});
+  a.run("screen='messages'; syncChatViewport()");
+  return viewport;
+}
+test('chat locks the document and tracks the visual viewport when the keyboard opens and closes', () => {
+  const a = app(), viewport = phoneChat(a);
+  assert.equal(a.classes.has('chat-open'), true);
+  assert.equal(a.styles.get('--chat-height'), '844px');
+  a.context.document.activeElement = a.text;
+  viewport.height = 460; viewport.offsetTop = 44;
+  a.run('syncChatViewport()');
+  assert.equal(a.classes.has('chat-keyboard-open'), true);
+  assert.equal(a.styles.get('--chat-height'), '460px');
+  assert.equal(a.styles.get('--chat-top'), '44px');
+  // iOS can dismiss the keyboard while leaving the textarea focused.
+  viewport.height = 844; viewport.offsetTop = 0;
+  a.run('syncChatViewport()');
+  assert.equal(a.classes.has('chat-keyboard-open'), false);
+  assert.equal(a.styles.get('--chat-height'), '844px');
+});
+test('hiding the keyboard while a send button takes focus keeps the tab hidden until it closes', () => {
+  const a = app(), viewport = phoneChat(a);
+  a.context.document.activeElement = a.text;
+  viewport.height = 460; a.run('syncChatViewport()');
+  a.context.document.activeElement = {tagName:'BUTTON'};
+  a.run('syncChatViewport()');
+  assert.equal(a.classes.has('chat-keyboard-open'), true);
+  viewport.height = 844; a.run('syncChatViewport()');
+  assert.equal(a.classes.has('chat-keyboard-open'), false);
+});
+test('viewport resizing follows the latest message and preserves scroll when reading older history', () => {
+  const a = app(), viewport = phoneChat(a);
+  a.log.scrollTop = 500;
+  a.context.document.activeElement = a.text;
+  viewport.height = 460;
+  a.run('syncChatViewport()');
+  assert.equal(a.log.scrollTop, a.log.scrollHeight);
+  a.log.scrollTop = 100;
+  viewport.height = 420; viewport.offsetTop = 20;
+  a.run('syncChatViewport()');
+  assert.equal(a.log.scrollTop, 100);
+});
+test('browser controls and pinch zoom do not count as an on-screen keyboard', () => {
+  const a = app(), viewport = phoneChat(a);
+  a.context.document.activeElement = a.text;
+  viewport.height = 790; a.run('syncChatViewport()');
+  assert.equal(a.classes.has('chat-keyboard-open'), false);
+  viewport.scale = 2; viewport.height = 390; a.run('syncChatViewport()');
+  assert.equal(a.classes.has('chat-keyboard-open'), false);
+  assert.equal(a.styles.get('--chat-height'), '790px');
+});
+test('leaving chat and logout restore normal page scrolling and clear keyboard geometry', () => {
+  const a = app(), viewport = phoneChat(a);
+  a.context.document.activeElement = a.text;
+  viewport.height = 460; a.run('syncChatViewport()');
+  a.run("screen='overview'; render()");
+  assert.equal(a.classes.has('chat-open'), false);
+  assert.equal(a.classes.has('chat-keyboard-open'), false);
+  assert.equal(a.styles.size, 0);
+  a.run("screen='messages'; render(); renderAuth(false)");
+  assert.equal(a.classes.has('chat-open'), false);
+  assert.equal(a.styles.size, 0);
+});
+test('older browsers without VisualViewport hide mobile tabs on focus and restore on blur', () => {
+  const a = app();
+  a.context.window.innerWidth = 390;
+  a.run("screen='messages'; syncChatViewport()");
+  a.context.document.activeElement = a.text;
+  a.events.get('focusin')();
+  assert.equal(a.classes.has('chat-keyboard-open'), true);
+  a.context.document.activeElement = {tagName:'BODY'};
+  a.run('syncChatViewport()');
+  assert.equal(a.classes.has('chat-keyboard-open'), false);
+});
+test('desktop focus retains navigation and portrait-to-landscape updates the available height', () => {
+  const a = app();
+  a.context.document.activeElement = a.text;
+  a.run("screen='messages'; syncChatViewport()");
+  assert.equal(a.classes.has('chat-keyboard-open'), false);
+  const viewport = phoneChat(a);
+  viewport.height = 390;
+  Object.assign(a.context.window, {innerWidth:844, innerHeight:390});
+  Object.assign(a.context.document.documentElement, {clientWidth:844,clientHeight:390});
+  a.events.get('window:resize')();
+  assert.equal(a.styles.get('--chat-height'), '390px');
+  assert.equal(a.classes.has('chat-keyboard-open'), false);
 });

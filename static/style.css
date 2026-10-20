@@ -48,3 +48,19 @@
 .read-receipt{color:#a1abbd;white-space:nowrap}
 .read-receipt.is-read{color:#6c87bb}
 @media(max-width:1000px){.bottom-nav .nav-icon{height:25px}.bottom-nav .unread-badge{top:-5px}}
+
+/* The conversation owns the viewport; only the message history can scroll. */
+html.chat-open{height:100%;overflow:hidden;overscroll-behavior:none}
+html.chat-open body{position:fixed;inset:0;width:100%;height:100%;overflow:hidden;overscroll-behavior:none}
+.shell.chat-shell{position:fixed;top:var(--chat-top,0px);left:0;right:0;height:var(--chat-height,100dvh);min-height:0;overflow:hidden;padding-top:env(safe-area-inset-top,0px)}
+.chat-shell .main.chat-main{height:100%;min-height:0;padding-bottom:0}
+.chat-shell .conversation{min-height:0;overflow:hidden}
+.chat-shell .chat-history{min-height:0;overflow-y:auto;overscroll-behavior-y:contain;-webkit-overflow-scrolling:touch}
+.chat-shell .chat-composer{flex-shrink:0}
+.chat-shell .chat-composer textarea{resize:none}
+@media(max-width:900px){
+  .shell.chat-shell{display:flex;flex-direction:column}
+  .chat-shell .main.chat-main{height:auto;flex:1;min-height:0;width:100%;margin:0}
+  .chat-shell .bottom-nav{position:static;flex-shrink:0}
+  html.chat-keyboard-open .chat-shell .bottom-nav{display:none}
+}

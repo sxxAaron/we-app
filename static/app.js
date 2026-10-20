@@ -6,6 +6,7 @@ let calendarMonth = '', selectedRecordDay = '', toastTimer, lastSync = '', refre
 let settingsSection = '';
 let messageDraft = '', chatHasMore = false, chatLoading = false;
 let markingRead = false;
+let chatViewportWidth = 0, chatRestingHeight = 0, chatKeyboardOpen = false;
 const icons = {
   overview: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
   messages: '<path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H4l-2 2V11.5a9.5 9.5 0 1 1 19 0Z"/><path d="M7 11h10m-10 4h6"/>',
@@ -145,12 +146,43 @@ async function markMessagesRead() {
   finally { markingRead = false; }
 }
 
+function syncChatViewport() {
+  const html = document.documentElement;
+  const active = !!state && screen === 'messages';
+  html.classList.toggle('chat-open', active);
+  if (!active) {
+    html.classList.remove('chat-keyboard-open');
+    html.style.removeProperty('--chat-height');
+    html.style.removeProperty('--chat-top');
+    chatViewportWidth = chatRestingHeight = 0; chatKeyboardOpen = false;
+    return;
+  }
+  const viewport = window.visualViewport;
+  // Pinch zoom is independent of the keyboard; retain the layout while zooming.
+  if (viewport && Math.abs(viewport.scale - 1) > .05) return;
+  const width = window.innerWidth || html.clientWidth;
+  const height = Math.round(viewport?.height || window.innerHeight || html.clientHeight);
+  const layoutHeight = Math.max(window.innerHeight || 0, html.clientHeight || 0, height);
+  const focused = document.activeElement?.id === 'comment-text';
+  if (width !== chatViewportWidth || (!focused && !chatKeyboardOpen)) {
+    chatViewportWidth = width; chatRestingHeight = layoutHeight;
+  } else chatRestingHeight = Math.max(chatRestingHeight, layoutHeight);
+  const mobile = window.matchMedia('(max-width: 900px)').matches;
+  chatKeyboardOpen = mobile && (((focused || chatKeyboardOpen) && chatRestingHeight - height > 120) || (!viewport && focused));
+  const list = $('#message-list');
+  const atBottom = list && list.scrollHeight - list.scrollTop - list.clientHeight < 70;
+  html.classList.toggle('chat-keyboard-open', chatKeyboardOpen);
+  html.style.setProperty('--chat-height', height + 'px');
+  html.style.setProperty('--chat-top', Math.max(0, viewport?.offsetTop || 0) + 'px');
+  if (atBottom) list.scrollTop = list.scrollHeight;
+}
+
 function render() {
   if (demo) state.plan = extendedPlan(state.plan, state.today);
   const previousChat = $('#message-list');
   const previousScroll = previousChat?.scrollTop ?? null;
   root.innerHTML = `
-    <div class="shell">
+    <div class="shell ${screen === 'messages' ? 'chat-shell' : ''}">
       <aside class="sidebar">
         ${brand()}
         ${nav()}
@@ -172,6 +204,7 @@ function render() {
       </main>
       ${nav('bottom-nav')}
     </div>`;
+  syncChatViewport();
   if (screen === 'messages') {
     const list = $('#message-list');
     list.scrollTop = previousScroll == null ? list.scrollHeight : previousScroll;
@@ -392,6 +425,7 @@ function settingsDetail() {
 }
 
 function renderAuth(setup) {
+  state = null; syncChatViewport();
   document.title = 'we.app · 体重记录';
   root.innerHTML = `<main class="auth-page ${setup ? 'setup' : ''}"><div class="auth-container">${brand()}<section class="auth-card"><header><h1>${setup ? '初始化账号' : '登录'}</h1><span>体重记录</span></header>
     <form id="${setup ? 'setup-form' : 'login-form'}">${setup ? `
@@ -542,11 +576,16 @@ document.addEventListener('submit', async event => {
   finally { if (submit) submit.disabled = false; }
 });
 document.addEventListener('visibilitychange', async () => {
-  if (!document.hidden) { await refresh(true); if (demo) await markMessagesRead(); }
+  if (!document.hidden) { syncChatViewport(); await refresh(true); if (demo) await markMessagesRead(); }
 });
 document.addEventListener('scroll', event => {
   if (event.target.id === 'message-list') void markMessagesRead();
 }, true);
+document.addEventListener('focusin', syncChatViewport);
+document.addEventListener('focusout', () => { setTimeout(syncChatViewport, 0); });
+window.addEventListener('resize', syncChatViewport, { passive: true });
+window.visualViewport?.addEventListener('resize', syncChatViewport, { passive: true });
+window.visualViewport?.addEventListener('scroll', syncChatViewport, { passive: true });
 document.addEventListener('keydown', event => {
   if (event.target.id === 'comment-text' && event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
     event.preventDefault();
