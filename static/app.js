@@ -2,10 +2,9 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const root = $('#app');
 let state, screen = 'overview', range = 0, demo = new URLSearchParams(location.search).get('demo') === '1';
-let includeEmpty = false, recordMonth = '', toastTimer, lastSync = '', refreshing = false;
+let calendarMonth = '', selectedRecordDay = '', toastTimer, lastSync = '', refreshing = false;
 let settingsSection = '';
-let messageDraft = '', chatHasMore = false, chatLoading = false, lastPoll = 0, todayDirty = false;
-const draft = { weight: '', note: '' };
+let messageDraft = '', chatHasMore = false, chatLoading = false, lastPoll = 0;
 const icons = {
   overview: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
   messages: '<path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H4l-2 2V11.5a9.5 9.5 0 1 1 19 0Z"/><path d="M7 11h10m-10 4h6"/>',
@@ -61,23 +60,19 @@ function syncLabel(error = false) {
   const element = $('#sync-status');
   if (element) { element.classList.toggle('sync-error', error); element.textContent = demo ? '演示数据' : error ? '连接中断，正在重试' : `已同步 ${lastSync}`; }
 }
-function resetDraft() {
-  todayDirty = false;
-  const record = recordFor(state.today); draft.version = record?.version ?? 0; draft.weight = record?.weight ?? ''; draft.note = record?.note ?? '';
-}
 async function load() {
-  if (demo) { state = demoState(); lastSync = '刚刚'; resetDraft(); render(); return; }
+  if (demo) { state = demoState(); lastSync = '刚刚'; render(); return; }
   try {
     const status = await api('/api/status');
     if (status.setupRequired) return renderAuth(true);
-    state = await api('/api/state'); chatHasMore = !!state.comments_has_more; lastSync = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }); resetDraft(); render();
+    state = await api('/api/state'); chatHasMore = !!state.comments_has_more; lastSync = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }); render();
   } catch (error) {
     if (error.status === 401) renderAuth(false);
     else root.innerHTML = `<div class="loading">连接失败<span>${escape(error.message)}</span><p><button class="quiet" data-action="reload">重新连接</button></p></div>`;
   }
 }
 async function refresh(force = false) {
-  if (demo || !state || refreshing) return;
+  if (demo || !state || refreshing) return false;
   const editing = /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
   if (!force && (document.hidden || $('#record-dialog').open || (editing && !document.activeElement.closest('#comment-form')))) return;
   if (!force && screen !== 'messages' && Date.now() - lastPoll < 15000) return;
@@ -92,13 +87,14 @@ async function refresh(force = false) {
     if (!hadOlder) chatHasMore = !!next.comments_has_more;
     state = next;
     lastSync = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
-    if (!todayDirty) resetDraft();
     if (screen === 'messages') { if (messagesChanged || force) updateChat(); }
     else if (force || (changed && screen !== 'settings')) render();
     syncLabel();
+    return true;
   } catch (error) {
     if (error.status === 401) { state = null; $('#record-dialog').close(); renderAuth(false); }
     else { syncLabel(true); if (force) toast(error.message); }
+    return false;
   } finally { refreshing = false; }
 }
 
@@ -150,24 +146,23 @@ function render() {
 }
 
 function overview() {
-  const list = state.records, first = list[0], latest = list.at(-1), current = recordFor(state.today);
+  const list = state.records, first = list[0], latest = list.at(-1);
   const change = latest && first ? latest.weight - first.weight : null;
   const goal = state.plan.goal_weight;
   const remaining = latest && goal != null ? Math.max(0, latest.weight - goal) : null;
   return `
     <section class="stats" aria-label="体重概况">
-      ${stat('最新体重', number(latest?.weight), '斤', latest ? fullDate(latest.day) : '暂无记录', 'weight', 'featured')}
+      ${latestWeightCard(latest)}
       ${stat('累计变化', changeText(change), '斤', first ? `首次 ${number(first.weight)} 斤` : '相较首次记录', 'trend', change < 0 ? 'decrease' : '')}
       ${stat('目标体重', number(goal), '斤', goal == null ? '未设置' : remaining == null ? '—' : remaining === 0 ? '已达目标' : `距目标 ${number(remaining)} 斤`, 'flag')}
       ${stat('已记录', list.length, `/ ${state.plan.days} 天`, `完成 ${Math.round(list.length / state.plan.days * 100)}%`, 'records')}
     </section>
-    <div class="content-grid overview-main">
+    <div class="overview-main">
       <section class="panel trend-panel">
         <div class="panel-head"><h2>体重趋势 <span class="unit-label">斤</span></h2><div class="range-switch" aria-label="曲线时间范围">${[7, 30, 0].map(n => `<button type="button" data-range="${n}" class="${range === n ? 'active' : ''}" aria-pressed="${range === n}">${n === 0 ? '全部' : n + '天'}</button>`).join('')}</div></div>
         <div class="chart">${chart()}</div>
         <div class="chart-caption"><i></i>体重<span>共 ${list.filter(r => range === 0 || r.day >= dayAdd(state.today > endDate() ? endDate() : state.today, 1 - range)).length} 条记录</span></div>
       </section>
-      ${todayCard(current)}
     </div>
     <div class="recent-records section-space">
       <section class="panel recent-panel"><div class="panel-head"><h2>最近记录</h2><button class="text-link" data-screen="records">全部记录 ${icon('arrow')}</button></div>${table([...list].reverse().slice(0, 5), false)}</section>
@@ -201,17 +196,9 @@ function chart() {
   return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="体重趋势，共 ${data.length} 条记录，从 ${number(data[0].weight)} 到 ${number(data.at(-1).weight)} 斤"><defs><linearGradient id="chart-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#6386ff" stop-opacity=".16"/><stop offset="100%" stop-color="#6386ff" stop-opacity="0"/></linearGradient></defs>${axis}${data.length > 1 ? `<polygon points="${x(data[0])},${height - bottom} ${points} ${x(data.at(-1))},${height - bottom}" fill="url(#chart-fill)"/><polyline points="${points}" fill="none" stroke="#3d63ed" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>` : ''}${dots}${labels}</svg>`;
 }
 
-function todayCard(current) {
-  const head = `<div class="panel-head"><h2>今日记录</h2><span class="date-line">${shortDate(state.today)}</span></div>`;
-  if (!owner()) return `<section class="panel record-card">${head}<div class="viewer-status">${current ? `<strong>${number(current.weight)}</strong><span>斤</span>` : '<span class="muted">今日未记录</span>'}</div>${current?.note ? `<div class="viewer-note">${escape(current.note)}</div>` : ''}<div class="record-status ${current ? 'saved' : ''}">${icon(current ? 'check' : 'clock')}${current ? '已记录' : '待记录'}</div></section>`;
-  const inPlan = state.today >= state.plan.start_date && state.today <= endDate();
-  if (!inPlan) return `<section class="panel record-card">${head}<div class="empty">${state.today < state.plan.start_date ? '计划未开始' : '计划已结束'}</div><button class="quiet wide" data-screen="records">查看记录</button></section>`;
-  return `<section class="panel record-card">${head}<form id="today-form" data-version="${draft.version ?? 0}">
-    <label class="weight-input"><span class="sr-only">体重</span><input name="weight" type="number" min="1" max="500" step="0.01" inputmode="decimal" placeholder="—" value="${escape(draft.weight)}" required aria-label="今天的体重，斤"><span>斤</span></label>
-    <label class="field">备注<textarea name="note" maxlength="500" placeholder="选填">${escape(draft.note)}</textarea></label>
-    <div class="error-box" role="alert"></div><button class="primary wide" type="submit">${icon(current ? 'check' : 'plus')}${current ? '更新记录' : '保存记录'}</button>
-    <div class="record-status ${current ? 'saved' : ''}">${icon(current ? 'check' : 'clock')}${current ? '今日已记录' : '今日未记录'}</div>
-  </form></section>`;
+function latestWeightCard(latest) {
+  const note = latest?.note || '';
+  return `<button type="button" class="stat featured latest-stat" data-action="latest-weight" aria-label="${latest ? '最新体重 ' + number(latest.weight) + ' 斤，' : ''}${owner() ? '编辑今日体重与备注' : '查看完整体重与备注'}"><div class="stat-label">最新体重${icon('weight')}</div><div class="stat-value"><strong>${number(latest?.weight)}</strong><span>斤</span></div><p class="latest-date">${latest ? fullDate(latest.day) : '暂无记录'}</p><div class="latest-note ${note ? '' : 'no-note'}" title="${escape(note)}">${escape(note.replace(/\s+/g, ' ') || (owner() ? '点击记录体重与备注' : '暂无备注'))}</div></button>`;
 }
 
 function table(rows, showEmpty) {
@@ -270,22 +257,65 @@ async function olderMessages() {
   }
 }
 
-function recordsPage() {
-  const days = Array.from({ length: state.plan.days }, (_, i) => dayAdd(state.plan.start_date, i));
-  return `<section class="panel calendar-panel"><div class="panel-head"><h2>记录日历</h2><span class="muted calendar-total">已记录 <b>${state.records.length}</b> / ${state.plan.days} 天</span></div>
-    <div class="calendar-legend"><span><i class="done-key"></i>已记录</span><span><i class="today-key"></i>今天</span></div>
-    <div class="calendar">${days.map((d, i) => `<${owner() && d <= state.today ? 'button' : 'span'} class="day-cell ${recordFor(d) ? 'done' : ''} ${d === state.today ? 'current' : ''} ${d > state.today ? 'future' : ''}" ${owner() && d <= state.today ? `data-edit="${d}"` : ''} title="${d}${recordFor(d) ? ' · ' + number(recordFor(d).weight) + ' 斤' : ''}" aria-label="第 ${i + 1} 天，${d}，${recordFor(d) ? '已记录' : '未记录'}">${i + 1}</${owner() && d <= state.today ? 'button' : 'span'}>`).join('')}</div>
-    <div class="calendar-label"><span>${fullDate(state.plan.start_date)}</span><span>${fullDate(endDate())}</span></div></section>
-    <section class="panel section-space"><div class="panel-head"><h2>全部记录</h2><button class="quiet" data-action="export">${icon('download')}导出 CSV</button></div>
-      <div class="record-toolbar"><label class="sr-only" for="record-month">按月份筛选记录</label><input id="record-month" class="input" type="month" value="${recordMonth}" aria-label="按月份筛选记录"><button class="text-link" data-action="clear-month">全部月份</button><label class="checkbox-label"><input id="include-empty" type="checkbox" ${includeEmpty ? 'checked' : ''}>显示未记录日期</label>${owner() ? `<button class="primary" data-action="new-record">${icon('plus')}记录体重</button>` : ''}</div>
-      <div id="records-table">${recordRows()}</div>
-    </section>`;
+function shiftMonth(month, amount) {
+  const date = new Date(month + '-01T00:00:00Z');
+  date.setUTCMonth(date.getUTCMonth() + amount);
+  return date.toISOString().slice(0, 7);
 }
 
-function recordRows() {
-  let rows = includeEmpty ? Array.from({ length: state.plan.days }, (_, i) => { const day = dayAdd(state.plan.start_date, i); return recordFor(day) || { day, weight: null, note: '' }; }) : state.records;
-  if (recordMonth) rows = rows.filter(r => r.day.startsWith(recordMonth));
-  return table([...rows].reverse(), true);
+function calendarSelection() {
+  const start = state.plan.start_date, end = endDate();
+  if (!selectedRecordDay || selectedRecordDay < start || selectedRecordDay > end) selectedRecordDay = state.today < start ? start : state.today > end ? end : state.today;
+  if (!calendarMonth) calendarMonth = selectedRecordDay.slice(0, 7);
+  calendarMonth = calendarMonth < start.slice(0, 7) ? start.slice(0, 7) : calendarMonth > end.slice(0, 7) ? end.slice(0, 7) : calendarMonth;
+}
+
+function recordsPage() {
+  calendarSelection();
+  const first = calendarMonth + '-01';
+  const gridStart = dayAdd(first, -new Date(first + 'T00:00:00Z').getUTCDay());
+  const records = new Map(state.records.map(r => [r.day, r]));
+  const monthRecords = state.records.filter(r => r.day.startsWith(calendarMonth));
+  return `<section class="month-calendar" aria-label="体重月历">
+    <div class="month-navigation"><button class="month-arrow previous" data-action="previous-month" aria-label="上个月" ${calendarMonth <= state.plan.start_date.slice(0, 7) ? 'disabled' : ''}>${icon('chevron')}</button><h2>${calendarMonth.replace('-', ' / ')}</h2><button class="month-arrow" data-action="next-month" aria-label="下个月" ${calendarMonth >= endDate().slice(0, 7) ? 'disabled' : ''}>${icon('chevron')}</button></div>
+    <div class="month-meta"><span>本月已记录 ${monthRecords.length} 天<span class="month-unit">体重 / 斤</span></span>${state.today >= state.plan.start_date && state.today <= endDate() ? '<button class="text-link" data-action="calendar-today">今天</button>' : ''}</div>
+    <div class="month-weekdays" aria-hidden="true">${['日', '一', '二', '三', '四', '五', '六'].map(d => `<span>${d}</span>`).join('')}</div>
+    <div class="month-grid">${Array.from({length:42}, (_, i) => {
+      const day = dayAdd(gridStart, i), record = records.get(day);
+      const inPlan = day >= state.plan.start_date && day <= endDate();
+      const status = record ? `${number(record.weight)} 斤，已记录` : day > state.today ? '未到记录日期' : inPlan ? '未记录' : '计划范围外';
+      return `<button type="button" class="month-day ${record ? 'has-record' : 'missing'} ${day.startsWith(calendarMonth) ? '' : 'outside-month'} ${inPlan ? '' : 'outside-plan'} ${day > state.today ? 'future' : ''} ${day === state.today ? 'is-today' : ''} ${day === selectedRecordDay ? 'is-selected' : ''}" data-day="${day}" aria-label="${day}，${status}" aria-pressed="${day === selectedRecordDay}" ${day === state.today ? 'aria-current="date"' : ''} ${inPlan ? '' : 'disabled'}><span class="month-day-date">${Number(day.slice(8))}</span><span class="month-day-weight">${record ? number(record.weight) : '—'}</span></button>`;
+    }).join('')}</div>
+    <div class="month-legend"><span><i class="recorded-key"></i>已记录</span><span><i class="missing-key"></i>未记录</span><span><i class="current-key"></i>今天</span></div>
+  </section><section class="selected-record panel" aria-label="所选日期记录">${selectedRecord()}</section>`;
+}
+
+function selectedRecord() {
+  const day = selectedRecordDay, record = recordFor(day);
+  const canEdit = owner() && day <= state.today && day >= state.plan.start_date && day <= endDate();
+  return `<div class="selected-record-head"><h2>${fullDate(day)}</h2>${canEdit ? `<button class="quiet" data-edit="${day}">${icon(record ? 'weight' : 'plus')}${record ? '编辑记录' : '记录体重'}</button>` : ''}</div>
+    ${record ? `<div class="selected-weight">${number(record.weight)}<span>斤</span></div><div class="selected-note">${escape(record.note || '暂无备注')}</div>` : `<div class="selected-empty">${day > state.today ? '未到记录日期' : '当天未记录'}</div>`}`;
+}
+
+function viewRecord(day) {
+  const record = recordFor(day), dialog = $('#record-dialog');
+  dialog.innerHTML = `<div class="dialog-head"><h2 id="record-title">记录详情</h2><button type="button" class="close" data-action="close-dialog" aria-label="关闭">×</button></div><div class="record-detail-date">${fullDate(day)}</div>${record ? `<div class="selected-weight">${number(record.weight)}<span>斤</span></div><div class="note-heading">备注</div><div class="full-note">${escape(record.note || '暂无备注')}</div>` : '<div class="empty">暂无记录</div>'}<button class="quiet wide detail-close" type="button" data-action="close-dialog">关闭</button>`;
+  dialog.showModal();
+}
+
+async function openLatestWeight() {
+  if (!demo) {
+    if (refreshing) { toast('正在同步，请稍后再试'); return; }
+    if (!(await refresh(true))) return;
+  }
+  if (!owner()) {
+    const latest = state.records.at(-1);
+    if (latest) viewRecord(latest.day);
+    else toast('暂无体重记录');
+    return;
+  }
+  if (state.today < state.plan.start_date || state.today > endDate()) { toast('今日不在计划范围内，请在计划设置中调整日期'); return; }
+  editRecord(state.today, true);
 }
 
 function settingsPage() {
@@ -338,19 +368,19 @@ function renderAuth(setup) {
     </form></section><a class="auth-demo" href="/?demo=1">查看演示 ${icon('arrow')}</a></div></main>`;
 }
 
-function editRecord(day) {
+function editRecord(day, fixedDay = false) {
   if (!owner()) return;
   const r = recordFor(day), dialog = $('#record-dialog');
-  dialog.innerHTML = `<div class="dialog-head"><h2 id="record-title">${r ? '修改记录' : '记录体重'}</h2><button type="button" class="close" data-action="close-dialog" aria-label="关闭">×</button></div><form id="edit-form" data-original-day="${day}" data-version="${r?.version ?? 0}"><label class="field">日期<input name="day" type="date" value="${day}" min="${state.plan.start_date}" max="${state.today < endDate() ? state.today : endDate()}" ${r ? 'readonly' : ''} required></label><label class="field">体重 <span class="optional">斤</span><input name="weight" type="number" min="1" max="500" step="0.01" inputmode="decimal" value="${r?.weight ?? ''}" required autofocus></label><label class="field">备注<textarea name="note" maxlength="500" rows="3" placeholder="选填">${escape(r?.note || '')}</textarea></label><div class="error-box" role="alert"></div><div class="button-row">${r ? '<button type="button" class="text-link danger" data-action="delete-record">删除记录</button>' : '<span></span>'}<button class="primary" type="submit">保存</button></div></form>`;
+  dialog.innerHTML = `<div class="dialog-head"><h2 id="record-title">${fixedDay ? '今日记录' : r ? '修改记录' : '记录体重'}</h2><button type="button" class="close" data-action="close-dialog" aria-label="关闭">×</button></div><form id="edit-form" data-original-day="${day}" data-version="${r?.version ?? 0}"><label class="field">日期<input name="day" type="date" value="${day}" min="${state.plan.start_date}" max="${state.today < endDate() ? state.today : endDate()}" ${r || fixedDay ? 'readonly' : ''} required></label><label class="field">体重 <span class="optional">斤</span><input name="weight" type="number" min="1" max="500" step="0.01" inputmode="decimal" value="${r?.weight ?? ''}" required autofocus></label><label class="field">备注<textarea name="note" maxlength="500" rows="3" placeholder="选填">${escape(r?.note || '')}</textarea></label><div class="error-box" role="alert"></div><div class="button-row">${r ? '<button type="button" class="text-link danger" data-action="delete-record">删除记录</button>' : '<span></span>'}<button class="primary" type="submit">保存</button></div></form>`;
   dialog.showModal();
 }
 
 async function saveRecord(day, weight, note, version) {
   if (demo) {
     const record = { day, weight, note, version: version + 1 };
-    state.records = [...state.records.filter(r => r.day !== day), record].sort((a, b) => a.day.localeCompare(b.day)); resetDraft(); render(); return;
+    state.records = [...state.records.filter(r => r.day !== day), record].sort((a, b) => a.day.localeCompare(b.day)); render(); return;
   }
-  await api('/api/records/' + day, 'PUT', { weight, note, version }); todayDirty = false; await refresh(true);
+  await api('/api/records/' + day, 'PUT', { weight, note, version }); await refresh(true);
 }
 function downloadDemo(kind) {
   let text, mime, filename;
@@ -367,14 +397,22 @@ document.addEventListener('click', async event => {
   else if (action === 'back-settings') { settingsSection = ''; render(); window.scrollTo({ top: 0 }); }
   else if (button.dataset.range) { range = Number(button.dataset.range); render(); }
   else if (button.dataset.edit) editRecord(button.dataset.edit);
+  else if (button.dataset.day) { selectedRecordDay = button.dataset.day; calendarMonth = selectedRecordDay.slice(0, 7); render(); }
+  else if (action === 'latest-weight') await openLatestWeight();
+  else if (action === 'previous-month' || action === 'next-month') {
+    calendarSelection();
+    const month = shiftMonth(calendarMonth, action === 'previous-month' ? -1 : 1);
+    if (month >= state.plan.start_date.slice(0, 7) && month <= endDate().slice(0, 7)) {
+      calendarMonth = month;
+      const inMonth = state.records.filter(r => r.day.startsWith(month));
+      selectedRecordDay = inMonth.at(-1)?.day || (month + '-01' < state.plan.start_date ? state.plan.start_date : month + '-01');
+      render();
+    }
+  }
+  else if (action === 'calendar-today') { selectedRecordDay = state.today; calendarMonth = state.today.slice(0, 7); render(); }
   else if (action === 'close-dialog') $('#record-dialog').close();
   else if (action === 'reload') load();
   else if (action === 'older-messages') await olderMessages();
-  else if (action === 'new-record') {
-    if (state.today < state.plan.start_date) toast('计划未开始');
-    else editRecord(state.today < endDate() ? state.today : endDate());
-  }
-  else if (action === 'clear-month') { recordMonth = ''; $('#record-month').value = ''; $('#records-table').innerHTML = recordRows(); }
   else if (action === 'sync') { if (demo) toast('当前是演示数据'); else await refresh(true); }
   else if (action === 'export' || action === 'backup') { if (demo) downloadDemo(action); else location.href = action === 'export' ? '/api/export.csv' : '/api/backup.json'; }
   else if (action === 'logout') {
@@ -386,14 +424,13 @@ document.addEventListener('click', async event => {
     if (!confirm(`确定删除 ${day} 的记录吗？删除后需要重新填写。`)) return;
     button.disabled = true;
     try {
-      if (demo) { state.records = state.records.filter(r => r.day !== day); resetDraft(); render(); }
+      if (demo) { state.records = state.records.filter(r => r.day !== day); render(); }
       else { await api('/api/records/' + day, 'DELETE', { version: Number(form.dataset.version) }); await refresh(true); }
       $('#record-dialog').close(); toast(demo ? '演示记录已删除，刷新页面会恢复' : '记录已删除');
     } catch (error) { $('.error-box', form).textContent = error.message; } finally { button.disabled = false; }
   }
 });
 document.addEventListener('input', event => {
-  if (event.target.closest('#today-form')) { draft[event.target.name] = event.target.value; todayDirty = true; }
   if (event.target.id === 'comment-text') messageDraft = event.target.value;
 });
 function updatePlanPreview(input) {
@@ -408,8 +445,6 @@ function updatePlanPreview(input) {
   $('#plan-mode-hint').textContent = auto ? '累计天数随每次延续增加，原记录保留' : '已指定结束日期，不自动延续';
 }
 document.addEventListener('change', event => {
-  if (event.target.id === 'record-month') { recordMonth = event.target.value; $('#records-table').innerHTML = recordRows(); }
-  if (event.target.id === 'include-empty') { includeEmpty = event.target.checked; $('#records-table').innerHTML = recordRows(); }
   if (event.target.closest('#plan-form')) updatePlanPreview(event.target);
   if (event.target.name === 'day' && event.target.closest('#edit-form')) {
     const form = event.target.form, r = recordFor(event.target.value); form.dataset.version = r?.version ?? 0;
@@ -424,7 +459,6 @@ document.addEventListener('submit', async event => {
     switch (form.id) {
       case 'login-form': await api('/api/login', 'POST', values); await load(); break;
       case 'setup-form': await api('/api/setup', 'POST', values); await load(); break;
-      case 'today-form': await saveRecord(state.today, Number(values.weight), values.note, Number(form.dataset.version)); toast(demo ? '演示记录已更新，不会保存到服务器' : '已保存'); break;
       case 'edit-form': await saveRecord(values.day, Number(values.weight), values.note, Number(form.dataset.version)); $('#record-dialog').close(); toast(demo ? '演示记录已更新，不会保存到服务器' : '记录已保存'); break;
       case 'comment-form':
         if (!values.text.trim()) throw new Error('请输入留言');

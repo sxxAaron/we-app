@@ -10,7 +10,7 @@ function app() {
   const log = { innerHTML: '', scrollTop: 100, scrollHeight: 900, clientHeight: 400 };
   const text = { value: '', tagName: 'TEXTAREA', closest: s => s === '#comment-form' };
   const status = { textContent: '', classList: { toggle() {}, add() {}, remove() {} } };
-  const nodes = new Map([['#app', root], ['#message-list', log], ['#comment-text', text], ['#chat-count', {}], ['#sync-status', status], ['#record-dialog', { open: false, close() {} }], ['#toast', status]]);
+  const nodes = new Map([['#app', root], ['#message-list', log], ['#comment-text', text], ['#chat-count', {}], ['#sync-status', status], ['#record-dialog', { open: false, showModal() { this.open=true; }, close() { this.open=false; } }], ['#toast', status]]);
   const events = new Map();
   const context = vm.createContext({
     URLSearchParams, console, Map, JSON, Date, setTimeout: () => 0, clearTimeout() {}, setInterval() {},
@@ -21,7 +21,7 @@ function app() {
   });
   vm.runInContext(source, context);
   const run = code => vm.runInContext(code, context);
-  run("state = demoState(); state.plan = extendedPlan(state.plan, state.today); resetDraft(); demo = true;");
+  run("state = demoState(); state.plan = extendedPlan(state.plan, state.today); demo = true;");
   return { run, context, events, nodes, root, log, text };
 }
 test('three primary tabs, history stays under home, and no home progress or chat', () => {
@@ -35,9 +35,10 @@ test('three primary tabs, history stays under home, and no home progress or chat
 });
 test('jin values stay unchanged across editing, stats, goal and chart', async () => {
   const a = app();
-  a.run("state.records[state.records.length - 1].weight = 166.6; state.plan.goal_weight = 150; resetDraft();");
+  a.run("state.records[state.records.length - 1].weight = 166.6; state.plan.goal_weight = 150;");
   assert.match(a.run('overview()'), /166\.6/);
-  assert.match(a.run('todayCard(recordFor(state.today))'), /value="166.6"/);
+  a.run('openLatestWeight()');
+  assert.match(a.nodes.get('#record-dialog').innerHTML, /value="166.6"/);
   assert.match(a.run('chart()'), /166\.6 斤/);
   a.run("settingsSection='goal'");
   assert.match(a.run('settingsPage()'), /value="150"/);
@@ -98,7 +99,8 @@ test('settings entries open a separate editor with a return action, preserving v
   await a.events.get('click')(click({action:'back-settings'}));
   assert.doesNotMatch(a.root.innerHTML, /<form/);
   a.run("state.user.role='viewer'; state.user.id=2;");
-  assert.doesNotMatch(a.run('todayCard(recordFor(state.today))'), /today-form/);
+  a.run('openLatestWeight()');
+  assert.doesNotMatch(a.nodes.get('#record-dialog').innerHTML, /edit-form|<input|删除记录/);
   assert.match(a.run('messages()'), /comment-form/);
   a.run("settingsSection='goal'");
   assert.doesNotMatch(a.run('settingsPage()'), /保存目标/);
@@ -123,7 +125,8 @@ test('renewed plans include every day in totals, calendar and the full curve', (
   a.run("state.today=dayAdd(state.plan.start_date,100); render();");
   assert.equal(a.run('state.plan.days'), 200);
   assert.match(a.run('overview()'), /\/ 200 天/);
-  assert.equal((a.run('recordsPage()').match(/class="day-cell /g)||[]).length, 200);
+  assert.equal((a.run('recordsPage()').match(/class="month-day /g)||[]).length, 42);
+  assert.equal(a.run('selectedRecordDay'), a.run('state.today'));
   a.run("state.records.push({day:state.today,weight:160,note:'',version:1}); range=0;");
   assert.match(a.run('chart()'), /共 13 条记录/);
   a.run("state.plan.auto_extend=false; state.today=dayAdd(state.plan.start_date,350); render();");
@@ -145,4 +148,74 @@ test('manual end selection disables renewal and returning keeps the plan intact'
   const before = a.run('JSON.stringify(state.plan)');
   await a.events.get('click')({target:{closest:()=>({dataset:{action:'back-settings'}})}});
   assert.equal(a.run('JSON.stringify(state.plan)'),before);
+});
+
+test('calendar aligns actual dates, covers leap day and labels recorded versus missing days', () => {
+  const a=app();
+  a.run("state.plan={start_date:'2024-01-01',days:100,goal_weight:null,version:1}; state.today='2024-02-15'; state.records=[{day:'2024-02-12',weight:166.6,note:'walk',version:1}]; calendarMonth='2024-02'; selectedRecordDay='2024-02-12';");
+  const calendar=a.run('recordsPage()');
+  assert.equal((calendar.match(/class="month-day /g)||[]).length,42);
+  assert.match(calendar,/data-day="2024-01-28"/);
+  assert.match(calendar,/data-day="2024-02-29"/);
+  assert.match(calendar,/data-day="2024-02-12"[^>]*aria-label="2024-02-12，166.6 斤，已记录"/);
+  assert.match(calendar,/data-day="2024-02-11"[^>]*aria-label="2024-02-11，未记录"/);
+  assert.doesNotMatch(calendar,/<table|records-table/);
+  assert.equal(a.run("shiftMonth('2024-12',1)"),'2025-01');
+  assert.equal(a.run("shiftMonth('2024-01',-1)"),'2023-12');
+});
+test('month controls stay inside the extended plan and selecting a date updates details', async () => {
+  const a=app();
+  a.run("screen='records'; calendarMonth='2026-10'; recordsPage();");
+  const click=dataset=>({target:{closest:()=>({dataset})}});
+  await a.events.get('click')(click({action:'previous-month'}));
+  assert.equal(a.run('calendarMonth'),'2026-10');
+  await a.events.get('click')(click({action:'next-month'}));
+  assert.equal(a.run('calendarMonth'),'2026-11');
+  await a.events.get('click')(click({day:'2026-10-29'}));
+  assert.equal(a.run('selectedRecordDay'),'2026-10-29');
+  assert.match(a.run('selectedRecord()'),/散步 40 分钟/);
+  await a.events.get('click')(click({action:'calendar-today'}));
+  assert.equal(a.run('selectedRecordDay'),a.run('state.today'));
+});
+test('latest weight opens today with its date fixed and never overwrites the previous record', async () => {
+  const a=app();
+  const yesterday=a.run('state.records.at(-1).day');
+  a.run('state.today=dayAdd(state.today,1);');
+  a.run('openLatestWeight()');
+  const dialog=a.nodes.get('#record-dialog');
+  assert.match(dialog.innerHTML,/今日记录/);
+  assert.match(dialog.innerHTML,/name="day"[^>]*value="2026-10-31"[^>]*readonly/);
+  assert.match(dialog.innerHTML,/name="weight"[^>]*value=""/);
+  const form={id:'edit-form',values:{day:'2026-10-31',weight:'161.5',note:'new note'},dataset:{version:'0'},querySelector:s=>s.includes('button')?{disabled:false}:{textContent:''}};
+  await a.events.get('submit')({target:form,preventDefault(){}});
+  assert.equal(a.run(`recordFor('${yesterday}').weight`),162.4);
+  assert.equal(a.run("recordFor('2026-10-31').weight"),161.5);
+  assert.equal(a.run("recordFor('2026-10-31').note"),'new note');
+  assert.equal(dialog.open,false);
+  assert.doesNotMatch(a.run('overview()'),/today-form|record-card/);
+});
+test('viewer opens the complete escaped note with no write controls; card preview is single-line', () => {
+  const a=app();
+  a.context.longNote='<script>test</script>\n'+'很长的备注'.repeat(60);
+  a.run("state.user.role='viewer'; state.records.at(-1).note=longNote; openLatestWeight();");
+  const dialog=a.nodes.get('#record-dialog').innerHTML;
+  assert.match(dialog,/full-note/);
+  assert.match(dialog,/&lt;script&gt;test&lt;\/script&gt;/);
+  assert.doesNotMatch(dialog,/<script>|<input|edit-form|删除记录/);
+  assert.equal(a.run('state.records.at(-1).note'),a.context.longNote);
+  const card=a.run('latestWeightCard(state.records.at(-1))');
+  assert.match(card,/class="latest-note /);
+  assert.match(card,/data-action="latest-weight"/);
+  assert.doesNotMatch(card,/<script>/);
+});
+test('latest editor refreshes the server date first and stays closed when sync fails', async () => {
+  const a=app();
+  a.run("demo=false; api=async()=>({...state,today:'2026-10-31'});");
+  await a.run('openLatestWeight()');
+  const dialog=a.nodes.get('#record-dialog');
+  assert.match(dialog.innerHTML,/name="day"[^>]*value="2026-10-31"/);
+  dialog.close();
+  a.run("api=async()=>{throw new Error('offline')};");
+  await a.run('openLatestWeight()');
+  assert.equal(dialog.open,false);
 });
