@@ -39,6 +39,7 @@ test('jin values stay unchanged across editing, stats, goal and chart', async ()
   assert.match(a.run('overview()'), /166\.6/);
   assert.match(a.run('todayCard(recordFor(state.today))'), /value="166.6"/);
   assert.match(a.run('chart()'), /166\.6 斤/);
+  a.run("settingsSection='goal'");
   assert.match(a.run('settingsPage()'), /value="150"/);
   assert.doesNotMatch(a.run('settingsPage()'), /\bkg\b|千克/);
   await a.run("saveRecord(state.today, 167.2, 'note', 1)");
@@ -80,13 +81,35 @@ test('separate plan and goal forms preserve the other setting and send raw jin',
   assert.equal(a.run('captured[2].goal_weight'), 150);
   assert.equal(a.run('captured[2].start_date'), '2026-10-18');
 });
-test('viewer can chat, sees four setting cards and has no weight or plan write forms', () => {
+test('settings entries open a separate editor with a return action, preserving viewer permissions', async () => {
   const a = app();
+  a.run("screen='settings'; render();");
+  assert.doesNotMatch(a.root.innerHTML, /page-heading|plan-pill|heading-separator|<form/);
+  assert.equal((a.root.innerHTML.match(/data-setting=/g)||[]).length, 4);
+  function click(dataset) { return { target: { closest: () => ({ dataset }) } }; }
+  await a.events.get('click')(click({setting:'goal'}));
+  assert.match(a.root.innerHTML, /id="goal-form"/);
+  assert.match(a.root.innerHTML, /data-action="back-settings"/);
+  assert.equal(a.run('screen'), 'settings');
+  await a.events.get('click')(click({action:'back-settings'}));
+  assert.doesNotMatch(a.root.innerHTML, /<form/);
   a.run("state.user.role='viewer'; state.user.id=2;");
   assert.doesNotMatch(a.run('todayCard(recordFor(state.today))'), /today-form/);
   assert.match(a.run('messages()'), /comment-form/);
-  const settings = a.run('settingsPage()');
-  assert.equal((settings.match(/<section class="setting-card/g)||[]).length, 4);
-  assert.doesNotMatch(settings, /保存计划|保存目标|data-action="backup"/);
-  assert.match(settings, /name="goal_weight"[^>]*disabled/);
+  a.run("settingsSection='goal'");
+  assert.doesNotMatch(a.run('settingsPage()'), /保存目标/);
+  assert.match(a.run('settingsPage()'), /name="goal_weight"[^>]*disabled/);
+  a.run("settingsSection='export'");
+  assert.doesNotMatch(a.run('settingsPage()'), /data-action="backup"/);
+});
+
+test('primary tabs have no page headings and conversation has no card or dialogue header', () => {
+  const a = app();
+  for (const tab of ['overview', 'messages', 'settings']) {
+    a.run(`screen='${tab}'; render();`);
+    assert.doesNotMatch(a.root.innerHTML, /page-heading|plan-pill|heading-separator|第 12 \/ 100 天/);
+  }
+  const chat = a.run('messages()');
+  assert.match(chat, /class="conversation"/);
+  assert.doesNotMatch(chat, /class="panel|chat-panel|<h[12]|chat-count/);
 });

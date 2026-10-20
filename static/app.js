@@ -3,6 +3,7 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const root = $('#app');
 let state, screen = 'overview', range = 100, demo = new URLSearchParams(location.search).get('demo') === '1';
 let includeEmpty = false, recordMonth = '', toastTimer, lastSync = '', refreshing = false;
+let settingsSection = '';
 let messageDraft = '', chatHasMore = false, chatLoading = false, lastPoll = 0, todayDirty = false;
 const draft = { weight: '', note: '' };
 const icons = {
@@ -108,10 +109,8 @@ function nav(extra = '') {
 }
 
 function render() {
-  const titles = { overview: '首页', records: '历史记录', messages: '留言', settings: '设置' };
   const previousChat = $('#message-list');
   const previousScroll = previousChat?.scrollTop ?? null;
-  const label = state.today < state.plan.start_date ? '计划未开始' : state.today > endDate() ? '计划已结束' : `第 ${elapsed()} / 100 天`;
   root.innerHTML = `
     <div class="shell">
       <aside class="sidebar">
@@ -129,10 +128,7 @@ function render() {
           <div class="account"><span class="avatar ${state.user.role}">${escape(state.user.name.slice(0, 1))}</span><span>${escape(state.user.name)}</span><button class="text-link logout" data-action="logout">${demo ? '退出演示' : '退出'}</button></div>
         </div>
         ${demo ? '<div class="demo-banner"><span>演示模式 · 示例数据不会保存</span><a href="/">返回应用 →</a></div>' : ''}
-        <header class="page-heading">
-          <div><h1>${titles[screen]}</h1><p>${fullDate(state.today)}<span class="heading-separator">/</span>${new Date(state.today + 'T12:00:00').toLocaleDateString('zh-CN', { weekday: 'long' })}</p></div>
-          ${screen === 'records' ? '<button class="quiet" data-screen="overview">返回首页</button>' : screen === 'messages' ? '<span class="chat-label">' + icon('messages') + '两人对话</span>' : '<span class="plan-pill">' + icon('calendar') + label + '</span>'}
-        </header>
+        ${screen === 'records' ? '<header class="detail-heading history-heading"><h1>历史记录</h1><button class="quiet return-button" data-screen="overview">返回 ' + icon('arrow') + '</button></header>' : ''}
         ${screen === 'overview' ? overview() : screen === 'messages' ? messages() : screen === 'records' ? recordsPage() : settingsPage()}
         <footer class="page-footer"><span>we.app</span><span class="sync-state"><i class="status-dot"></i><span id="sync-status">${demo ? '演示数据' : `已同步 ${lastSync}`}</span><button class="icon-button" data-action="sync" aria-label="刷新同步">${icon('refresh')}</button></span></footer>
       </main>
@@ -226,8 +222,7 @@ function chatHistory() {
 }
 
 function messages() {
-  return `<section class="panel chat-panel" aria-label="两人留言">
-    <div class="chat-panel-head"><span class="chat-symbol">${icon('messages')}</span><div><h2>对话</h2><span id="chat-count">${state.comments.length} 条留言</span></div><span class="chat-sync"><i class="status-dot"></i>自动同步</span></div>
+  return `<section class="conversation" aria-label="两人留言">
     <div class="chat-history" id="message-list" role="log" aria-label="聊天记录" aria-live="polite" aria-relevant="additions">${chatHistory()}</div>
     <form class="chat-composer" id="comment-form"><div class="error-box" role="alert"></div><div class="chat-composer-row"><label class="sr-only" for="comment-text">留言内容</label><textarea id="comment-text" name="text" rows="2" maxlength="500" placeholder="发消息…" required>${escape(messageDraft)}</textarea><button class="primary" type="submit" aria-label="发送留言">${icon('send')}<span>发送</span></button></div><div class="composer-hint">Enter 发送 · Shift + Enter 换行</div></form>
   </section>`;
@@ -285,31 +280,33 @@ function recordRows() {
 }
 
 function settingsPage() {
-  const latest = state.records.at(-1);
-  return `<div class="settings-board">
-    <section class="setting-card plan-setting">
-      <header class="setting-header"><span class="setting-icon blue">${icon('calendar')}</span><div><h2>计划设置</h2><p>100 天计划</p></div><span class="setting-chip">${state.today < state.plan.start_date ? '未开始' : state.today > endDate() ? '已结束' : '进行中'}</span></header>
-      <div class="plan-dates"><div><span>开始</span><strong>${fullDate(state.plan.start_date)}</strong></div>${icon('arrow')}<div><span>结束</span><strong>${fullDate(endDate())}</strong></div></div>
-      <form id="plan-form" data-version="${state.plan.version}"><label class="field">开始日期<input name="start_date" type="date" value="${state.plan.start_date}" required ${owner() ? '' : 'disabled'}></label><div class="error-box" role="alert"></div>${owner() ? '<button class="quiet wide" type="submit">保存计划</button>' : ''}</form>
-      <p class="setting-footnote">计划结束后，记录仍会保留</p>
-    </section>
-    <section class="setting-card goal-setting">
-      <header class="setting-header"><span class="setting-icon purple">${icon('flag')}</span><div><h2>目标体重</h2><p>可随时调整</p></div></header>
-      <div class="goal-current"><span>最新体重</span><strong>${number(latest?.weight)}<small>斤</small></strong></div>
-      <form id="goal-form" data-version="${state.plan.version}"><label class="field">目标体重 <span class="optional">选填 · 斤</span><div class="goal-input-wrap"><input name="goal_weight" type="number" min="1" max="500" step="0.01" inputmode="decimal" placeholder="未设置" value="${state.plan.goal_weight ?? ''}" ${owner() ? '' : 'disabled'}><span>斤</span></div></label><div class="error-box" role="alert"></div>${owner() ? '<button class="primary wide" type="submit">保存目标</button>' : ''}</form>
-    </section>
-    <section class="setting-card account-setting">
-      <header class="setting-header"><span class="setting-icon peach">${icon('lock')}</span><div><h2>账号设置</h2><p>登录与密码</p></div></header>
-      <div class="setting-account"><span class="avatar ${state.user.role}">${escape(state.user.name.slice(0, 1))}</span><div><strong>${escape(state.user.username)}</strong><span>${owner() ? '记录体重与留言' : '查看记录与留言'}</span></div><span class="role-badge">${owner() ? '记录者' : '查看者'}</span></div>
-      <form id="password-form"><label class="field">当前密码<input name="current" type="password" autocomplete="current-password" maxlength="128" required></label><label class="field">新密码<input name="password" type="password" autocomplete="new-password" minlength="10" maxlength="128" placeholder="至少 10 个字符" required></label><div class="error-box" role="alert"></div><button class="quiet wide" type="submit">修改密码</button></form>
-    </section>
-    <section class="setting-card export-setting">
-      <header class="setting-header"><span class="setting-icon mint">${icon('download')}</span><div><h2>数据导出</h2><p>保存到自己的设备</p></div></header>
-      <button class="export-option" data-action="export"><span class="file-icon">CSV</span><span><strong>体重记录</strong><small>日期、体重、备注</small></span>${icon('chevron')}</button>
-      ${owner() ? `<button class="export-option" data-action="backup"><span class="file-icon json">JSON</span><span><strong>完整数据</strong><small>计划、记录、全部留言</small></span>${icon('chevron')}</button>` : ''}
-      <div class="data-retention"><span class="retention-mark">${icon('check')}</span><div><strong>记录与留言不会自动过期</strong><span>登录状态过期后，重新登录即可</span></div></div>
-    </section>
-  </div>`;
+  if (settingsSection) return settingsDetail();
+  const entries = [
+    ['plan', 'calendar', 'blue', '计划设置', `${fullDate(state.plan.start_date)} — ${fullDate(endDate())}`],
+    ['goal', 'flag', 'purple', '目标体重', state.plan.goal_weight == null ? '未设置' : `${number(state.plan.goal_weight)} 斤`],
+    ['account', 'lock', 'peach', '账号设置', state.user.username],
+    ['export', 'download', 'mint', '数据导出', owner() ? 'CSV / JSON' : 'CSV']
+  ];
+  return `<div class="settings-menu" aria-label="设置选项">${entries.map(([key, symbol, color, title, value]) => `<button class="settings-entry" data-setting="${key}"><span class="setting-icon ${color}">${icon(symbol)}</span><span class="settings-entry-text"><strong>${title}</strong><small>${escape(value)}</small></span>${icon('chevron')}</button>`).join('')}</div>`;
+}
+
+function settingsDetail() {
+  const titles = { plan: '计划设置', goal: '目标体重', account: '账号设置', export: '数据导出' };
+  let content = '';
+  if (settingsSection === 'plan') content = `
+    <div class="plan-dates"><div><span>开始</span><strong>${fullDate(state.plan.start_date)}</strong></div>${icon('arrow')}<div><span>结束</span><strong>${fullDate(endDate())}</strong></div></div>
+    <form id="plan-form" data-version="${state.plan.version}"><label class="field">开始日期<input name="start_date" type="date" value="${state.plan.start_date}" required ${owner() ? '' : 'disabled'}></label><div class="error-box" role="alert"></div>${owner() ? '<button class="primary wide" type="submit">保存计划</button>' : ''}</form><p class="setting-footnote">计划结束后，记录仍会保留</p>`;
+  if (settingsSection === 'goal') content = `
+    <div class="goal-current"><span>最新体重</span><strong>${number(state.records.at(-1)?.weight)}<small>斤</small></strong></div>
+    <form id="goal-form" data-version="${state.plan.version}"><label class="field">目标体重 <span class="optional">选填 · 斤</span><div class="goal-input-wrap"><input name="goal_weight" type="number" min="1" max="500" step="0.01" inputmode="decimal" placeholder="未设置" value="${state.plan.goal_weight ?? ''}" ${owner() ? '' : 'disabled'}><span>斤</span></div></label><div class="error-box" role="alert"></div>${owner() ? '<button class="primary wide" type="submit">保存目标</button>' : ''}</form>`;
+  if (settingsSection === 'account') content = `
+    <div class="setting-account"><span class="avatar ${state.user.role}">${escape(state.user.name.slice(0, 1))}</span><div><strong>${escape(state.user.username)}</strong><span>${owner() ? '记录体重与留言' : '查看记录与留言'}</span></div><span class="role-badge">${owner() ? '记录者' : '查看者'}</span></div>
+    <form id="password-form"><label class="field">当前密码<input name="current" type="password" autocomplete="current-password" maxlength="128" required></label><label class="field">新密码<input name="password" type="password" autocomplete="new-password" minlength="10" maxlength="128" placeholder="至少 10 个字符" required></label><div class="error-box" role="alert"></div><button class="primary wide" type="submit">修改密码</button></form>`;
+  if (settingsSection === 'export') content = `
+    <button class="export-option" data-action="export"><span class="file-icon">CSV</span><span><strong>体重记录</strong><small>日期、体重、备注</small></span>${icon('chevron')}</button>
+    ${owner() ? `<button class="export-option" data-action="backup"><span class="file-icon json">JSON</span><span><strong>完整数据</strong><small>计划、记录、全部留言</small></span>${icon('chevron')}</button>` : ''}
+    <div class="data-retention"><span class="retention-mark">${icon('check')}</span><div><strong>记录与留言不会自动过期</strong><span>登录状态过期后，重新登录即可</span></div></div>`;
+  return `<section class="settings-detail"><header class="detail-heading"><h1>${titles[settingsSection]}</h1><button type="button" class="quiet return-button" data-action="back-settings">返回 ${icon('arrow')}</button></header><div class="settings-editor ${settingsSection}-editor">${content}</div></section>`;
 }
 
 function renderAuth(setup) {
@@ -348,7 +345,9 @@ function downloadDemo(kind) {
 document.addEventListener('click', async event => {
   const button = event.target.closest('button'); if (!button) return;
   const action = button.dataset.action;
-  if (button.dataset.screen) { screen = button.dataset.screen; render(); window.scrollTo({ top: 0 }); }
+  if (button.dataset.screen) { screen = button.dataset.screen; settingsSection = ''; render(); window.scrollTo({ top: 0 }); }
+  else if (button.dataset.setting) { settingsSection = button.dataset.setting; screen = 'settings'; render(); window.scrollTo({ top: 0 }); }
+  else if (action === 'back-settings') { settingsSection = ''; render(); window.scrollTo({ top: 0 }); }
   else if (button.dataset.range) { range = Number(button.dataset.range); render(); }
   else if (button.dataset.edit) editRecord(button.dataset.edit);
   else if (action === 'close-dialog') $('#record-dialog').close();
