@@ -131,7 +131,29 @@ def read_plan(db):
     plan = json.loads(db.execute('SELECT value FROM settings WHERE id=1').fetchone()[0])
     # Historical numbers were entered in jin; keep them unchanged.
     plan.setdefault('weight_unit', 'jin')
+    plan.setdefault('auto_extend', True)
+    plan['end_date'] = (date.fromisoformat(plan['start_date']) + timedelta(days=plan['days'] - 1)).isoformat()
     return plan
+
+
+def extend_plan_if_needed(db):
+    """Catch up in 100-day blocks under a lock; each boundary is applied once."""
+    plan = read_plan(db)
+    if not plan['auto_extend'] or today().isoformat() <= plan['end_date']:
+        return
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        plan = read_plan(db)
+        overdue = (today() - date.fromisoformat(plan['end_date'])).days
+        if plan['auto_extend'] and overdue > 0:
+            plan['days'] += ((overdue - 1) // 100 + 1) * 100
+            plan['end_date'] = (date.fromisoformat(plan['start_date']) + timedelta(days=plan['days'] - 1)).isoformat()
+            plan['version'] += 1
+            db.execute('UPDATE settings SET value=? WHERE id=1', (json.dumps(plan),))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
 
 def read_comments(db, before=None):
@@ -322,7 +344,7 @@ class Handler(BaseHTTPRequestHandler):
                     name = text_field(payload.get(prefix + '_name', default_name), 24, '昵称', True)
                     db.execute('INSERT INTO users(username,name,password,role) VALUES(?,?,?,?)', (username, name, hash_password(password), role))
                 start = valid_day(payload.get('start_date', '2026-10-19'))
-                plan = {'start_date': start.isoformat(), 'days': 100, 'goal_weight': None, 'weight_unit': 'jin', 'version': 1}
+                plan = {'start_date': start.isoformat(), 'days': 100, 'goal_weight': None, 'weight_unit': 'jin', 'auto_extend': True, 'version': 1}
                 db.execute('INSERT INTO settings VALUES(1,?)', (json.dumps(plan),))
                 user_id = db.execute("SELECT id FROM users WHERE role='owner'").fetchone()[0]
             else:
@@ -340,6 +362,8 @@ class Handler(BaseHTTPRequestHandler):
             db.execute('DELETE FROM attempts WHERE ip=?', (ip,))
             return 200, {'ok': True}, 'application/json; charset=utf-8', cookie
         user = self.session(db, mutate=method != 'GET')
+        if path in ('/api/state', '/api/plan', '/api/export.csv', '/api/backup.json') or path.startswith('/api/records/'):
+            extend_plan_if_needed(db)
         if path == '/api/state' and method == 'GET':
             history = read_comments(db)
             return 200, {'user': {k: user[k] for k in ('id', 'username', 'name', 'role')}, 'csrf': user['csrf'],
@@ -359,8 +383,8 @@ class Handler(BaseHTTPRequestHandler):
             day = valid_day(path.removeprefix('/api/records/'))
             plan = read_plan(db)
             start = date.fromisoformat(plan['start_date'])
-            if not start <= day < start + timedelta(days=plan['days']):
-                raise APIError(400, '日期不在这次 100 天计划内')
+            if not start <= day <= date.fromisoformat(plan['end_date']):
+                raise APIError(400, '日期不在计划范围内')
             if day > today():
                 raise APIError(400, '还不能记录未来的体重')
             payload = self.body()
@@ -391,15 +415,33 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/plan' and method == 'PUT':
             self.session(db, mutate=True, owner=True)
             payload = self.body()
-            start = valid_day(payload.get('start_date'))
-            goal = valid_weight(payload.get('goal_weight'), optional=True)
             db.execute('BEGIN IMMEDIATE')
             current = read_plan(db)
             if payload.get('version') != current['version']:
                 raise APIError(409, '计划已在其他页面更新，请刷新后重试')
-            if db.execute('SELECT day FROM records WHERE day<? OR day>=? LIMIT 1', (start.isoformat(), (start + timedelta(days=100)).isoformat())).fetchone():
+            start = valid_day(payload.get('start_date', current['start_date']))
+            goal = valid_weight(payload['goal_weight'], optional=True) if 'goal_weight' in payload else current['goal_weight']
+            auto_extend = payload.get('auto_extend', False if 'end_date' in payload else current['auto_extend'])
+            if type(auto_extend) is not bool:
+                raise APIError(400, '自动延续设置无效')
+            if auto_extend:
+                days = current['days']
+                elapsed_days = (today() - start).days + 1
+                if elapsed_days > days:
+                    days += ((elapsed_days - days - 1) // 100 + 1) * 100
+                try:
+                    end = start + timedelta(days=days - 1)
+                except OverflowError:
+                    raise APIError(400, '计划日期范围无效')
+            else:
+                end = valid_day(payload.get('end_date', current['end_date']))
+                days = (end - start).days + 1
+                if not 1 <= days <= 36525:
+                    raise APIError(400, '结束日期不得早于开始日期，计划范围最多为 100 年')
+            if db.execute('SELECT day FROM records WHERE day<? OR day>? LIMIT 1', (start.isoformat(), end.isoformat())).fetchone():
                 raise APIError(400, '修改后的计划会排除已有记录，请保留这些日期')
-            current.update(start_date=start.isoformat(), goal_weight=goal, version=current['version'] + 1)
+            current.update(start_date=start.isoformat(), end_date=end.isoformat(), days=days,
+                           auto_extend=auto_extend, goal_weight=goal, version=current['version'] + 1)
             db.execute('UPDATE settings SET value=? WHERE id=1', (json.dumps(current),))
             return 200, {'ok': True}
         if path == '/api/password' and method == 'POST':

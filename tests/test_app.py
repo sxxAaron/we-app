@@ -200,6 +200,84 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.owner.request('/api/plan', 'PUT', {'start_date': self.start, 'goal_weight': 75, 'version': 1})[0], 409)
         self.assertEqual(self.owner.request('/api/plan', 'PUT', {'start_date': (server.today() + timedelta(days=1)).isoformat(), 'version': 2})[0], 400)
 
+    def test_plan_auto_extends_at_boundary_and_catches_up_without_reset(self):
+        self.save(weight=166.6)
+        actual_today = server.today
+        start = server.date.fromisoformat(self.start)
+        try:
+            server.today = lambda: start + timedelta(days=99)
+            self.assertEqual(self.owner.sync()[1]['plan']['days'], 100)
+            server.today = lambda: start + timedelta(days=100)
+            state = self.owner.sync()[1]
+            self.assertEqual(state['plan']['days'], 200)
+            self.assertEqual(state['plan']['end_date'], (start + timedelta(days=199)).isoformat())
+            self.assertEqual(state['plan']['start_date'], self.start)
+            self.assertEqual(state['records'][0]['weight'], 166.6)
+            version = state['plan']['version']
+            self.assertEqual(self.viewer.sync()[1]['plan']['version'], version)
+            self.assertEqual(self.owner.sync()[1]['plan']['days'], 200)
+            self.assertEqual(self.owner.request('/api/records/' + server.today().isoformat(), 'PUT', {'weight': 165.5, 'version': 0})[0], 200)
+            server.today = lambda: start + timedelta(days=301)
+            state = self.owner.sync()[1]
+            self.assertEqual(state['plan']['days'], 400)
+            self.assertEqual(len(state['records']), 2)
+            rows = list(csv.reader(io.StringIO(self.owner.request('/api/export.csv')[1].decode('utf-8-sig'))))
+            self.assertEqual(len(rows), 401)
+            server.initialize()
+            # Extension totals are persisted, even if the clock later moves backwards.
+            server.today = actual_today
+            self.assertEqual(self.owner.sync()[1]['plan']['days'], 400)
+        finally:
+            server.today = actual_today
+
+    def test_manual_end_stops_extension_and_can_be_resumed(self):
+        self.save()
+        start = server.date.fromisoformat(self.start)
+        end = (start + timedelta(days=29)).isoformat()
+        self.assertEqual(self.owner.request('/api/plan', 'PUT', {'end_date': end, 'version': 1})[0], 200)
+        plan = self.owner.sync()[1]['plan']
+        self.assertFalse(plan['auto_extend'])
+        self.assertEqual(plan['days'], 30)
+        actual_today = server.today
+        try:
+            server.today = lambda: start + timedelta(days=150)
+            self.assertEqual(self.owner.sync()[1]['plan']['days'], 30)
+            self.assertEqual(self.owner.request('/api/records/' + server.today().isoformat(), 'PUT', {'weight': 160, 'version': 0})[0], 400)
+            self.assertEqual(self.owner.request('/api/plan', 'PUT', {'goal_weight': 150, 'version': plan['version']})[0], 200)
+            plan = self.owner.sync()[1]['plan']
+            self.assertFalse(plan['auto_extend'])
+            self.assertEqual(plan['end_date'], end)
+            self.assertEqual(self.owner.request('/api/plan', 'PUT', {'auto_extend': True, 'version': plan['version']})[0], 200)
+            self.assertTrue(self.owner.sync()[1]['plan']['auto_extend'])
+            self.assertEqual(self.owner.sync()[1]['plan']['days'], 230)
+        finally:
+            server.today = actual_today
+
+    def test_manual_end_validation_and_viewer_permissions(self):
+        self.save()
+        for payload in [
+            {'end_date': (server.today() - timedelta(days=1)).isoformat()},
+            {'end_date': (server.date.fromisoformat(self.start) - timedelta(days=1)).isoformat()},
+            {'end_date': 'invalid'},
+            {'end_date': '9999-01-01'},
+            {'auto_extend': 'true'},
+        ]:
+            self.assertEqual(self.owner.request('/api/plan', 'PUT', {**payload, 'version': 1})[0], 400)
+        self.assertEqual(self.viewer.request('/api/plan', 'PUT', {'end_date': self.day, 'version': 1})[0], 403)
+        self.assertEqual(self.owner.sync()[1]['plan']['days'], 100)
+
+    def test_simultaneous_plan_reads_extend_only_once(self):
+        from concurrent.futures import ThreadPoolExecutor
+        actual_today = server.today
+        try:
+            server.today = lambda: server.date.fromisoformat(self.start) + timedelta(days=100)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                states = list(pool.map(lambda client: client.sync()[1], [self.owner, self.viewer]))
+            self.assertEqual([s['plan']['days'] for s in states], [200, 200])
+            self.assertEqual([s['plan']['version'] for s in states], [2, 2])
+        finally:
+            server.today = actual_today
+
     def test_csv_export_and_formula_injection(self):
         self.save(note='=HYPERLINK("https://example.com")')
         code, raw, headers = self.owner.request('/api/export.csv')

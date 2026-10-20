@@ -21,7 +21,7 @@ function app() {
   });
   vm.runInContext(source, context);
   const run = code => vm.runInContext(code, context);
-  run("state = demoState(); resetDraft(); demo = true;");
+  run("state = demoState(); state.plan = extendedPlan(state.plan, state.today); resetDraft(); demo = true;");
   return { run, context, events, nodes, root, log, text };
 }
 test('three primary tabs, history stays under home, and no home progress or chat', () => {
@@ -77,9 +77,13 @@ test('separate plan and goal forms preserve the other setting and send raw jin',
   assert.equal(a.run('captured[2].goal_weight'), 148.5);
   assert.equal(a.run('captured[2].version'), 1);
   assert.equal(a.run('captured[2].start_date'), '2026-10-19');
-  await a.events.get('submit')({ target: form('plan-form',{start_date:'2026-10-18'}), preventDefault() {} });
+  await a.events.get('submit')({ target: form('plan-form',{start_date:'2026-10-18',auto_extend:'on',end_date:'2027-01-25'}), preventDefault() {} });
   assert.equal(a.run('captured[2].goal_weight'), 150);
   assert.equal(a.run('captured[2].start_date'), '2026-10-18');
+  assert.equal(a.run('captured[2].auto_extend'), true);
+  await a.events.get('submit')({ target: form('plan-form',{start_date:'2026-10-19',end_date:'2026-12-31'}), preventDefault() {} });
+  assert.equal(a.run('captured[2].auto_extend'), false);
+  assert.equal(a.run('captured[2].end_date'), '2026-12-31');
 });
 test('settings entries open a separate editor with a return action, preserving viewer permissions', async () => {
   const a = app();
@@ -112,4 +116,33 @@ test('primary tabs have no page headings and conversation has no card or dialogu
   const chat = a.run('messages()');
   assert.match(chat, /class="conversation"/);
   assert.doesNotMatch(chat, /class="panel|chat-panel|<h[12]|chat-count/);
+});
+
+test('renewed plans include every day in totals, calendar and the full curve', () => {
+  const a = app();
+  a.run("state.today=dayAdd(state.plan.start_date,100); render();");
+  assert.equal(a.run('state.plan.days'), 200);
+  assert.match(a.run('overview()'), /\/ 200 天/);
+  assert.equal((a.run('recordsPage()').match(/class="day-cell /g)||[]).length, 200);
+  a.run("state.records.push({day:state.today,weight:160,note:'',version:1}); range=0;");
+  assert.match(a.run('chart()'), /共 13 条记录/);
+  a.run("state.plan.auto_extend=false; state.today=dayAdd(state.plan.start_date,350); render();");
+  assert.equal(a.run('state.plan.days'), 200);
+});
+test('manual end selection disables renewal and returning keeps the plan intact', async () => {
+  const a = app();
+  const hint = {textContent:''};
+  a.nodes.set('#plan-mode-hint',hint);
+  const form = {elements:{auto_extend:{checked:true},start_date:{value:'2026-10-19'},end_date:{value:'2026-12-31'}}};
+  a.context.manualInput = {form,name:'end_date'};
+  a.run('updatePlanPreview(manualInput)');
+  assert.equal(form.elements.auto_extend.checked,false);
+  assert.match(hint.textContent,/不自动延续/);
+  a.run("settingsSection='plan'");
+  const html = a.run('settingsPage()');
+  assert.match(html, /name="end_date"/);
+  assert.ok(html.indexOf('data-action="back-settings"') < html.indexOf('<h1>计划设置</h1>'));
+  const before = a.run('JSON.stringify(state.plan)');
+  await a.events.get('click')({target:{closest:()=>({dataset:{action:'back-settings'}})}});
+  assert.equal(a.run('JSON.stringify(state.plan)'),before);
 });
