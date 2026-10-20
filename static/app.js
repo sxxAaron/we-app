@@ -3,9 +3,13 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const root = $('#app');
 let state, screen = 'overview', range = 100, demo = new URLSearchParams(location.search).get('demo') === '1';
 let includeEmpty = false, recordMonth = '', toastTimer, lastSync = '', refreshing = false;
+let messageDraft = '', chatHasMore = false, chatLoading = false, lastPoll = 0, todayDirty = false;
 const draft = { weight: '', note: '' };
 const icons = {
   overview: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+  messages: '<path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H4l-2 2V11.5a9.5 9.5 0 1 1 19 0Z"/><path d="M7 11h10m-10 4h6"/>',
+  lock: '<rect x="5" y="10" width="14" height="11" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2"/>',
+  chevron: '<path d="m9 5 7 7-7 7"/>',
   records: '<rect x="4" y="5" width="16" height="16" rx="3"/><path d="M8 3v4m8-4v4M4 11h16m-11 4h2m3 0h2m-7 3h2"/>',
   settings: '<path d="M9 4h6m-3 0v16M4 9h16M4 16h16"/><circle cx="8" cy="9" r="2" fill="currentColor"/><circle cx="16" cy="16" r="2" fill="currentColor"/>',
   weight: '<path d="M5 8h14l2 12H3L5 8Z"/><path d="M8 8a4 4 0 1 1 8 0m-4-3v3"/>',
@@ -49,14 +53,15 @@ function syncLabel(error = false) {
   if (element) { element.classList.toggle('sync-error', error); element.textContent = demo ? '演示数据' : error ? '连接中断，正在重试' : `已同步 ${lastSync}`; }
 }
 function resetDraft() {
-  const record = recordFor(state.today); draft.weight = record?.weight ?? ''; draft.note = record?.note ?? '';
+  todayDirty = false;
+  const record = recordFor(state.today); draft.version = record?.version ?? 0; draft.weight = record?.weight ?? ''; draft.note = record?.note ?? '';
 }
 async function load() {
   if (demo) { state = demoState(); lastSync = '刚刚'; resetDraft(); render(); return; }
   try {
     const status = await api('/api/status');
     if (status.setupRequired) return renderAuth(true);
-    state = await api('/api/state'); lastSync = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }); resetDraft(); render();
+    state = await api('/api/state'); chatHasMore = !!state.comments_has_more; lastSync = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }); resetDraft(); render();
   } catch (error) {
     if (error.status === 401) renderAuth(false);
     else root.innerHTML = `<div class="loading">连接失败<span>${escape(error.message)}</span><p><button class="quiet" data-action="reload">重新连接</button></p></div>`;
@@ -64,35 +69,48 @@ async function load() {
 }
 async function refresh(force = false) {
   if (demo || !state || refreshing) return;
-  if (!force && (document.hidden || $('#record-dialog').open || /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName))) return;
+  const editing = /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
+  if (!force && (document.hidden || $('#record-dialog').open || (editing && !document.activeElement.closest('#comment-form')))) return;
+  if (!force && screen !== 'messages' && Date.now() - lastPoll < 15000) return;
   refreshing = true;
+  lastPoll = Date.now();
   try {
     const next = await api('/api/state');
-    const changed = JSON.stringify([state.records, state.comments, state.plan, state.today]) !== JSON.stringify([next.records, next.comments, next.plan, next.today]);
+    const changed = JSON.stringify([state.records, state.plan, state.today]) !== JSON.stringify([next.records, next.plan, next.today]);
+    const messagesChanged = JSON.stringify(state.comments.slice(-100)) !== JSON.stringify(next.comments);
+    const hadOlder = state.comments.length > next.comments.length;
+    next.comments = [...new Map([...state.comments, ...next.comments].map(c => [c.id, c])).values()].sort((a, b) => a.id - b.id);
+    if (!hadOlder) chatHasMore = !!next.comments_has_more;
     state = next;
     lastSync = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
-    if (force || changed) { resetDraft(); render(); }
-    else syncLabel();
+    if (!todayDirty) resetDraft();
+    if (screen === 'messages') { if (messagesChanged || force) updateChat(); }
+    else if (force || (changed && screen !== 'settings')) render();
+    syncLabel();
   } catch (error) {
     if (error.status === 401) { state = null; $('#record-dialog').close(); renderAuth(false); }
     else { syncLabel(true); if (force) toast(error.message); }
   } finally { refreshing = false; }
 }
+
 function demoState() {
-  const weights = [82.4, 82.2, 82.3, 81.9, 82.0, 81.7, 81.8, 81.6, 81.5, 81.7, 81.3, 81.2];
+  const weights = [164.8, 164.4, 164.6, 163.8, 164.0, 163.4, 163.6, 163.2, 163.0, 163.4, 162.6, 162.4];
   const notes = ['早晨空腹测量', '', '散步 30 分钟', '', '', '', '', '', '', '晚餐火锅', '散步 40 分钟', '早晨空腹测量'];
-  return { user: { id: 1, username: 'demo', name: '记录者', role: 'owner' }, today: '2026-10-30', plan: { start_date: '2026-10-19', days: 100, goal_weight: 76, version: 1 }, records: weights.map((weight, i) => ({ day: dayAdd('2026-10-19', i), weight, note: notes[i], version: 1 })), comments: [{ id: 1, user_id: 2, name: '查看者', role: 'viewer', text: '明天早上记得称一下。', created_at: '2026-10-29T20:36:00+08:00' }, { id: 2, user_id: 1, name: '记录者', role: 'owner', text: '好，明早记录。', created_at: '2026-10-29T21:04:00+08:00' }, { id: 3, user_id: 2, name: '查看者', role: 'viewer', text: '晚上去散步？', created_at: '2026-10-30T09:18:00+08:00' }] };
+  return { user: { id: 1, username: 'demo', name: '记录者', role: 'owner' }, today: '2026-10-30', plan: { start_date: '2026-10-19', days: 100, goal_weight: 152, weight_unit: 'jin', version: 1 }, records: weights.map((weight, i) => ({ day: dayAdd('2026-10-19', i), weight, note: notes[i], version: 1 })), comments: [{ id: 1, user_id: 2, name: '查看者', role: 'viewer', text: '明天早上记得称一下。', created_at: '2026-10-29T20:36:00+08:00' }, { id: 2, user_id: 1, name: '记录者', role: 'owner', text: '好，明早记录。', created_at: '2026-10-29T21:04:00+08:00' }, { id: 3, user_id: 2, name: '查看者', role: 'viewer', text: '晚上去散步？', created_at: '2026-10-30T09:18:00+08:00' }] };
 }
 function nav(extra = '') {
-  const tabs = [['overview', '概览'], ['records', '记录'], ['settings', '设置']];
+  const tabs = [['overview', '首页'], ['messages', '留言'], ['settings', '设置']];
+  const selected = screen === 'records' ? 'overview' : screen;
   return `<nav class="${extra || 'nav'}" aria-label="主导航">${tabs.map(([key, label]) => `
-    <button type="button" data-screen="${key}" class="${screen === key ? 'active' : ''}" ${screen === key ? 'aria-current="page"' : ''}>
+    <button type="button" data-screen="${key}" class="${selected === key ? 'active' : ''}" ${selected === key ? 'aria-current="page"' : ''}>
       ${icon(key)}<span>${label}</span>
     </button>`).join('')}</nav>`;
 }
 
 function render() {
-  const titles = { overview: '概览', records: '记录', settings: '设置' };
+  const titles = { overview: '首页', records: '历史记录', messages: '留言', settings: '设置' };
+  const previousChat = $('#message-list');
+  const previousScroll = previousChat?.scrollTop ?? null;
   const label = state.today < state.plan.start_date ? '计划未开始' : state.today > endDate() ? '计划已结束' : `第 ${elapsed()} / 100 天`;
   root.innerHTML = `
     <div class="shell">
@@ -104,7 +122,7 @@ function render() {
           <span class="sidebar-product">100 天体重记录</span>
         </div>
       </aside>
-      <main class="main">
+      <main class="main ${screen === 'messages' ? 'chat-main' : ''}">
         <div class="topbar">
           <div class="breadcrumb">we.app <span>/</span> 体重记录</div>
           ${brand('mobile-brand')}
@@ -113,13 +131,17 @@ function render() {
         ${demo ? '<div class="demo-banner"><span>演示模式 · 示例数据不会保存</span><a href="/">返回应用 →</a></div>' : ''}
         <header class="page-heading">
           <div><h1>${titles[screen]}</h1><p>${fullDate(state.today)}<span class="heading-separator">/</span>${new Date(state.today + 'T12:00:00').toLocaleDateString('zh-CN', { weekday: 'long' })}</p></div>
-          <span class="plan-pill">${icon('calendar')}${label}</span>
+          ${screen === 'records' ? '<button class="quiet" data-screen="overview">返回首页</button>' : screen === 'messages' ? '<span class="chat-label">' + icon('messages') + '两人对话</span>' : '<span class="plan-pill">' + icon('calendar') + label + '</span>'}
         </header>
-        ${screen === 'overview' ? overview() : screen === 'records' ? recordsPage() : settingsPage()}
+        ${screen === 'overview' ? overview() : screen === 'messages' ? messages() : screen === 'records' ? recordsPage() : settingsPage()}
         <footer class="page-footer"><span>we.app</span><span class="sync-state"><i class="status-dot"></i><span id="sync-status">${demo ? '演示数据' : `已同步 ${lastSync}`}</span><button class="icon-button" data-action="sync" aria-label="刷新同步">${icon('refresh')}</button></span></footer>
       </main>
       ${nav('bottom-nav')}
     </div>`;
+  if (screen === 'messages') {
+    const list = $('#message-list');
+    list.scrollTop = previousScroll == null ? list.scrollHeight : previousScroll;
+  }
 }
 
 function overview() {
@@ -129,26 +151,21 @@ function overview() {
   const remaining = latest && goal != null ? Math.max(0, latest.weight - goal) : null;
   return `
     <section class="stats" aria-label="体重概况">
-      ${stat('最新体重', number(latest?.weight), 'kg', latest ? fullDate(latest.day) : '暂无记录', 'weight', 'featured')}
-      ${stat('累计变化', changeText(change), 'kg', first ? `首次 ${number(first.weight)} kg` : '相较首次记录', 'trend', change < 0 ? 'decrease' : '')}
-      ${stat('目标体重', number(goal), 'kg', goal == null ? '未设置' : remaining == null ? '—' : remaining === 0 ? '已达目标' : `距目标 ${number(remaining)} kg`, 'flag')}
+      ${stat('最新体重', number(latest?.weight), '斤', latest ? fullDate(latest.day) : '暂无记录', 'weight', 'featured')}
+      ${stat('累计变化', changeText(change), '斤', first ? `首次 ${number(first.weight)} 斤` : '相较首次记录', 'trend', change < 0 ? 'decrease' : '')}
+      ${stat('目标体重', number(goal), '斤', goal == null ? '未设置' : remaining == null ? '—' : remaining === 0 ? '已达目标' : `距目标 ${number(remaining)} 斤`, 'flag')}
       ${stat('已记录', list.length, '/ 100 天', `完成 ${list.length}%`, 'records')}
     </section>
-    <section class="plan-strip" aria-label="计划进度">
-      <div class="plan-label"><span class="plan-mark">100</span><div><strong>100 天计划</strong><span>${fullDate(state.plan.start_date)} — ${fullDate(endDate())}</span></div></div>
-      <div class="plan-progress"><div><span>时间进度</span><b>${elapsed()}<small> / 100 天</small></b></div><progress value="${elapsed()}" max="100" aria-label="计划已进行 ${elapsed()} 天"></progress></div>
-    </section>
-    <div class="content-grid">
+    <div class="content-grid overview-main">
       <section class="panel trend-panel">
-        <div class="panel-head"><h2>体重趋势 <span class="unit-label">kg</span></h2><div class="range-switch" aria-label="曲线时间范围">${[7, 30, 100].map(n => `<button type="button" data-range="${n}" class="${range === n ? 'active' : ''}" aria-pressed="${range === n}">${n === 100 ? '全部' : n + '天'}</button>`).join('')}</div></div>
+        <div class="panel-head"><h2>体重趋势 <span class="unit-label">斤</span></h2><div class="range-switch" aria-label="曲线时间范围">${[7, 30, 100].map(n => `<button type="button" data-range="${n}" class="${range === n ? 'active' : ''}" aria-pressed="${range === n}">${n === 100 ? '全部' : n + '天'}</button>`).join('')}</div></div>
         <div class="chart">${chart()}</div>
         <div class="chart-caption"><i></i>体重<span>共 ${list.filter(r => range === 100 || r.day >= dayAdd(state.today > endDate() ? endDate() : state.today, 1 - range)).length} 条记录</span></div>
       </section>
       ${todayCard(current)}
     </div>
-    <div class="content-grid lower">
+    <div class="recent-records section-space">
       <section class="panel recent-panel"><div class="panel-head"><h2>最近记录</h2><button class="text-link" data-screen="records">全部记录 ${icon('arrow')}</button></div>${table([...list].reverse().slice(0, 5), false)}</section>
-      ${messages()}
     </div>`;
 }
 
@@ -175,17 +192,17 @@ function chart() {
   }).join('');
   const indices = [...new Set([0, Math.floor((data.length - 1) / 3), Math.floor((data.length - 1) * 2 / 3), data.length - 1])];
   const labels = indices.map(i => `<text x="${x(data[i])}" y="${height - 8}" text-anchor="middle" font-size="11" fill="#9299ab">${shortDate(data[i].day)}</text>`).join('');
-  const dots = data.map((r, i) => `<circle cx="${x(r)}" cy="${y(r.weight)}" r="${data.length > 40 ? 2 : i === data.length - 1 ? 4 : 3}" fill="${i === data.length - 1 ? '#3d63ed' : '#fff'}" stroke="#3d63ed" stroke-width="2"><title>${r.day} · ${number(r.weight)} kg</title></circle>`).join('');
-  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="体重趋势，共 ${data.length} 条记录，从 ${number(data[0].weight)} 到 ${number(data.at(-1).weight)} 千克"><defs><linearGradient id="chart-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#6386ff" stop-opacity=".16"/><stop offset="100%" stop-color="#6386ff" stop-opacity="0"/></linearGradient></defs>${axis}${data.length > 1 ? `<polygon points="${x(data[0])},${height - bottom} ${points} ${x(data.at(-1))},${height - bottom}" fill="url(#chart-fill)"/><polyline points="${points}" fill="none" stroke="#3d63ed" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>` : ''}${dots}${labels}</svg>`;
+  const dots = data.map((r, i) => `<circle cx="${x(r)}" cy="${y(r.weight)}" r="${data.length > 40 ? 2 : i === data.length - 1 ? 4 : 3}" fill="${i === data.length - 1 ? '#3d63ed' : '#fff'}" stroke="#3d63ed" stroke-width="2"><title>${r.day} · ${number(r.weight)} 斤</title></circle>`).join('');
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="体重趋势，共 ${data.length} 条记录，从 ${number(data[0].weight)} 到 ${number(data.at(-1).weight)} 斤"><defs><linearGradient id="chart-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#6386ff" stop-opacity=".16"/><stop offset="100%" stop-color="#6386ff" stop-opacity="0"/></linearGradient></defs>${axis}${data.length > 1 ? `<polygon points="${x(data[0])},${height - bottom} ${points} ${x(data.at(-1))},${height - bottom}" fill="url(#chart-fill)"/><polyline points="${points}" fill="none" stroke="#3d63ed" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>` : ''}${dots}${labels}</svg>`;
 }
 
 function todayCard(current) {
   const head = `<div class="panel-head"><h2>今日记录</h2><span class="date-line">${shortDate(state.today)}</span></div>`;
-  if (!owner()) return `<section class="panel record-card">${head}<div class="viewer-status">${current ? `<strong>${number(current.weight)}</strong><span>kg</span>` : '<span class="muted">今日未记录</span>'}</div>${current?.note ? `<div class="viewer-note">${escape(current.note)}</div>` : ''}<div class="record-status ${current ? 'saved' : ''}">${icon(current ? 'check' : 'clock')}${current ? '已记录' : '待记录'}</div></section>`;
+  if (!owner()) return `<section class="panel record-card">${head}<div class="viewer-status">${current ? `<strong>${number(current.weight)}</strong><span>斤</span>` : '<span class="muted">今日未记录</span>'}</div>${current?.note ? `<div class="viewer-note">${escape(current.note)}</div>` : ''}<div class="record-status ${current ? 'saved' : ''}">${icon(current ? 'check' : 'clock')}${current ? '已记录' : '待记录'}</div></section>`;
   const inPlan = state.today >= state.plan.start_date && state.today <= endDate();
   if (!inPlan) return `<section class="panel record-card">${head}<div class="empty">${state.today < state.plan.start_date ? '计划未开始' : '计划已结束'}</div><button class="quiet wide" data-screen="records">查看记录</button></section>`;
-  return `<section class="panel record-card">${head}<form id="today-form" data-version="${current?.version ?? 0}">
-    <label class="weight-input"><span class="sr-only">体重</span><input name="weight" type="number" min="1" max="500" step="0.01" inputmode="decimal" placeholder="—" value="${escape(draft.weight)}" required aria-label="今天的体重，千克"><span>kg</span></label>
+  return `<section class="panel record-card">${head}<form id="today-form" data-version="${draft.version ?? 0}">
+    <label class="weight-input"><span class="sr-only">体重</span><input name="weight" type="number" min="1" max="500" step="0.01" inputmode="decimal" placeholder="—" value="${escape(draft.weight)}" required aria-label="今天的体重，斤"><span>斤</span></label>
     <label class="field">备注<textarea name="note" maxlength="500" placeholder="选填">${escape(draft.note)}</textarea></label>
     <div class="error-box" role="alert"></div><button class="primary wide" type="submit">${icon(current ? 'check' : 'plus')}${current ? '更新记录' : '保存记录'}</button>
     <div class="record-status ${current ? 'saved' : ''}">${icon(current ? 'check' : 'clock')}${current ? '今日已记录' : '今日未记录'}</div>
@@ -194,21 +211,66 @@ function todayCard(current) {
 
 function table(rows, showEmpty) {
   if (!rows.length) return '<div class="empty table-empty">暂无记录</div>';
-  return `<div class="table-wrap"><table><thead><tr><th>日期</th><th class="numeric">体重 <span>/ kg</span></th><th>备注</th>${owner() ? '<th class="action-cell"></th>' : ''}</tr></thead><tbody>${rows.map(r => `<tr><td><span class="table-date">${shortDate(r.day)}</span>${r.day === state.today ? '<span class="badge">今天</span>' : ''}${showEmpty ? `<div class="table-day">第 ${dayDiff(r.day, state.plan.start_date) + 1} 天</div>` : ''}</td><td class="numeric"><b>${number(r.weight)}</b></td><td class="note">${r.weight == null ? r.day > state.today ? '未开始' : '未记录' : escape(r.note || '—')}</td>${owner() ? `<td class="action-cell">${r.day <= state.today ? `<button class="text-link" data-edit="${r.day}">${r.weight == null ? '补记' : '修改'}</button>` : ''}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>日期</th><th class="numeric">体重 <span>/ 斤</span></th><th>备注</th>${owner() ? '<th class="action-cell"></th>' : ''}</tr></thead><tbody>${rows.map(r => `<tr><td><span class="table-date">${shortDate(r.day)}</span>${r.day === state.today ? '<span class="badge">今天</span>' : ''}${showEmpty ? `<div class="table-day">第 ${dayDiff(r.day, state.plan.start_date) + 1} 天</div>` : ''}</td><td class="numeric"><b>${number(r.weight)}</b></td><td class="note">${r.weight == null ? r.day > state.today ? '未开始' : '未记录' : escape(r.note || '—')}</td>${owner() ? `<td class="action-cell">${r.day <= state.today ? `<button class="text-link" data-edit="${r.day}">${r.weight == null ? '补记' : '修改'}</button>` : ''}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+}
+
+function chatHistory() {
+  let lastDay = '';
+  return `${chatHasMore ? `<div class="older-messages"><button class="text-link" data-action="older-messages" ${chatLoading ? 'disabled' : ''}>${chatLoading ? '加载中…' : '查看更早的留言'}</button></div>` : ''}${state.comments.length ? state.comments.map(c => {
+    const day = c.created_at.slice(0, 10);
+    const divider = day !== lastDay ? `<div class="chat-date"><span>${day === state.today ? '今天' : fullDate(day)}</span></div>` : '';
+    lastDay = day;
+    const own = c.user_id === state.user.id;
+    return `${divider}<article class="chat-message ${own ? 'own-message' : ''}"><span class="avatar ${c.role}">${escape(c.name.slice(0, 1))}</span><div class="chat-message-body"><div class="chat-author">${escape(c.name)}</div><p class="chat-bubble">${escape(c.text)}</p><time datetime="${escape(c.created_at)}">${c.created_at.slice(11, 16)}</time></div></article>`;
+  }).join('') : '<div class="chat-empty">' + icon('messages') + '<span>暂无留言</span></div>'}`;
 }
 
 function messages() {
-  return `<section class="panel messages-panel"><div class="panel-head"><h2>留言</h2><span class="count-badge">${state.comments.length}</span></div>
-    <div class="message-list" id="message-list">${state.comments.length ? state.comments.map(c => `<article class="message ${c.user_id === state.user.id ? 'own-message' : ''}"><span class="avatar ${c.role}">${escape(c.name.slice(0, 1))}</span><div class="message-main"><div class="message-head"><span>${escape(c.name)}</span><time datetime="${escape(c.created_at)}">${shortDate(c.created_at.slice(0, 10))} ${c.created_at.slice(11, 16)}</time></div><p>${escape(c.text)}</p></div></article>`).join('') : '<div class="empty message-empty">暂无留言</div>'}</div>
-    <form class="comment-form" id="comment-form"><label class="sr-only" for="comment-text">留言内容</label><textarea id="comment-text" name="text" rows="1" maxlength="500" placeholder="写留言…" required></textarea><button class="primary" type="submit" aria-label="发送留言">${icon('send')}</button></form>
+  return `<section class="panel chat-panel" aria-label="两人留言">
+    <div class="chat-panel-head"><span class="chat-symbol">${icon('messages')}</span><div><h2>对话</h2><span id="chat-count">${state.comments.length} 条留言</span></div><span class="chat-sync"><i class="status-dot"></i>自动同步</span></div>
+    <div class="chat-history" id="message-list" role="log" aria-label="聊天记录" aria-live="polite" aria-relevant="additions">${chatHistory()}</div>
+    <form class="chat-composer" id="comment-form"><div class="error-box" role="alert"></div><div class="chat-composer-row"><label class="sr-only" for="comment-text">留言内容</label><textarea id="comment-text" name="text" rows="2" maxlength="500" placeholder="发消息…" required>${escape(messageDraft)}</textarea><button class="primary" type="submit" aria-label="发送留言">${icon('send')}<span>发送</span></button></div><div class="composer-hint">Enter 发送 · Shift + Enter 换行</div></form>
   </section>`;
+}
+
+function updateChat(forceBottom = false) {
+  const list = $('#message-list');
+  if (!list) return;
+  const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 70;
+  const top = list.scrollTop;
+  list.innerHTML = chatHistory();
+  list.scrollTop = forceBottom || nearBottom ? list.scrollHeight : top;
+  if ($('#chat-count')) $('#chat-count').textContent = `${state.comments.length} 条留言`;
+}
+
+async function olderMessages() {
+  if (chatLoading || !chatHasMore || !state.comments.length) return;
+  chatLoading = true;
+  const list = $('#message-list'), beforeHeight = list.scrollHeight, beforeTop = list.scrollTop;
+  const button = $('[data-action="older-messages"]');
+  if (button) { button.disabled = true; button.textContent = '加载中…'; }
+  try {
+    const history = await api('/api/comments?before=' + state.comments[0].id);
+    const merged = new Map([...history.comments, ...state.comments].map(c => [c.id, c]));
+    state.comments = [...merged.values()].sort((a, b) => a.id - b.id);
+    chatHasMore = history.has_more;
+    chatLoading = false;
+    list.innerHTML = chatHistory();
+    list.scrollTop = beforeTop + list.scrollHeight - beforeHeight;
+    if ($('#chat-count')) $('#chat-count').textContent = `${state.comments.length} 条留言`;
+  } catch (error) { toast(error.message); }
+  finally {
+    chatLoading = false;
+    const control = $('[data-action="older-messages"]');
+    if (control) { control.disabled = false; control.textContent = '查看更早的留言'; }
+  }
 }
 
 function recordsPage() {
   const days = Array.from({ length: 100 }, (_, i) => dayAdd(state.plan.start_date, i));
   return `<section class="panel calendar-panel"><div class="panel-head"><h2>记录日历</h2><span class="muted calendar-total">已记录 <b>${state.records.length}</b> / 100 天</span></div>
     <div class="calendar-legend"><span><i class="done-key"></i>已记录</span><span><i class="today-key"></i>今天</span></div>
-    <div class="calendar">${days.map((d, i) => `<${owner() && d <= state.today ? 'button' : 'span'} class="day-cell ${recordFor(d) ? 'done' : ''} ${d === state.today ? 'current' : ''} ${d > state.today ? 'future' : ''}" ${owner() && d <= state.today ? `data-edit="${d}"` : ''} title="${d}${recordFor(d) ? ' · ' + number(recordFor(d).weight) + ' kg' : ''}" aria-label="第 ${i + 1} 天，${d}，${recordFor(d) ? '已记录' : '未记录'}">${i + 1}</${owner() && d <= state.today ? 'button' : 'span'}>`).join('')}</div>
+    <div class="calendar">${days.map((d, i) => `<${owner() && d <= state.today ? 'button' : 'span'} class="day-cell ${recordFor(d) ? 'done' : ''} ${d === state.today ? 'current' : ''} ${d > state.today ? 'future' : ''}" ${owner() && d <= state.today ? `data-edit="${d}"` : ''} title="${d}${recordFor(d) ? ' · ' + number(recordFor(d).weight) + ' 斤' : ''}" aria-label="第 ${i + 1} 天，${d}，${recordFor(d) ? '已记录' : '未记录'}">${i + 1}</${owner() && d <= state.today ? 'button' : 'span'}>`).join('')}</div>
     <div class="calendar-label"><span>${fullDate(state.plan.start_date)}</span><span>${fullDate(endDate())}</span></div></section>
     <section class="panel section-space"><div class="panel-head"><h2>全部记录</h2><button class="quiet" data-action="export">${icon('download')}导出 CSV</button></div>
       <div class="record-toolbar"><label class="sr-only" for="record-month">按月份筛选记录</label><input id="record-month" class="input" type="month" value="${recordMonth}" aria-label="按月份筛选记录"><button class="text-link" data-action="clear-month">全部月份</button><label class="checkbox-label"><input id="include-empty" type="checkbox" ${includeEmpty ? 'checked' : ''}>显示未记录日期</label>${owner() ? `<button class="primary" data-action="new-record">${icon('plus')}记录体重</button>` : ''}</div>
@@ -223,10 +285,30 @@ function recordRows() {
 }
 
 function settingsPage() {
-  return `<div class="settings-grid">
-    <section class="panel"><div class="panel-head"><h2>计划</h2>${icon('calendar')}</div><form id="plan-form"><label class="field">开始日期<input name="start_date" type="date" value="${state.plan.start_date}" required ${owner() ? '' : 'disabled'}></label><label class="field">结束日期<input value="${endDate()} · 100 天" disabled></label><label class="field">目标体重 <span class="optional">选填 · kg</span><input name="goal_weight" type="number" min="1" max="500" step="0.01" inputmode="decimal" placeholder="未设置" value="${state.plan.goal_weight ?? ''}" ${owner() ? '' : 'disabled'}></label><div class="error-box" role="alert"></div>${owner() ? '<button class="primary" type="submit">保存设置</button>' : ''}</form></section>
-    <section class="panel"><div class="panel-head"><h2>账号</h2><span class="role-badge">${owner() ? '记录者' : '查看与留言'}</span></div><div class="account-summary"><span class="avatar ${state.user.role}">${escape(state.user.name.slice(0, 1))}</span><strong>${escape(state.user.username)}</strong></div><form id="password-form"><label class="field">当前密码<input name="current" type="password" autocomplete="current-password" maxlength="128" required></label><label class="field">新密码<input name="password" type="password" autocomplete="new-password" minlength="10" maxlength="128" placeholder="至少 10 个字符" required></label><div class="error-box" role="alert"></div><button class="quiet" type="submit">修改密码</button></form></section>
-    <section class="panel data-panel"><div class="panel-head"><h2>数据</h2>${icon('download')}</div><div class="data-export-row"><div><strong>体重记录</strong><span>日期、体重、备注</span></div><button class="quiet" data-action="export">导出 CSV ${icon('arrow')}</button></div>${owner() ? '<div class="data-export-row"><div><strong>完整数据</strong><span>计划、记录、留言</span></div><button class="quiet" data-action="backup">下载备份 ' + icon('arrow') + '</button></div>' : ''}</section>
+  const latest = state.records.at(-1);
+  return `<div class="settings-board">
+    <section class="setting-card plan-setting">
+      <header class="setting-header"><span class="setting-icon blue">${icon('calendar')}</span><div><h2>计划设置</h2><p>100 天计划</p></div><span class="setting-chip">${state.today < state.plan.start_date ? '未开始' : state.today > endDate() ? '已结束' : '进行中'}</span></header>
+      <div class="plan-dates"><div><span>开始</span><strong>${fullDate(state.plan.start_date)}</strong></div>${icon('arrow')}<div><span>结束</span><strong>${fullDate(endDate())}</strong></div></div>
+      <form id="plan-form" data-version="${state.plan.version}"><label class="field">开始日期<input name="start_date" type="date" value="${state.plan.start_date}" required ${owner() ? '' : 'disabled'}></label><div class="error-box" role="alert"></div>${owner() ? '<button class="quiet wide" type="submit">保存计划</button>' : ''}</form>
+      <p class="setting-footnote">计划结束后，记录仍会保留</p>
+    </section>
+    <section class="setting-card goal-setting">
+      <header class="setting-header"><span class="setting-icon purple">${icon('flag')}</span><div><h2>目标体重</h2><p>可随时调整</p></div></header>
+      <div class="goal-current"><span>最新体重</span><strong>${number(latest?.weight)}<small>斤</small></strong></div>
+      <form id="goal-form" data-version="${state.plan.version}"><label class="field">目标体重 <span class="optional">选填 · 斤</span><div class="goal-input-wrap"><input name="goal_weight" type="number" min="1" max="500" step="0.01" inputmode="decimal" placeholder="未设置" value="${state.plan.goal_weight ?? ''}" ${owner() ? '' : 'disabled'}><span>斤</span></div></label><div class="error-box" role="alert"></div>${owner() ? '<button class="primary wide" type="submit">保存目标</button>' : ''}</form>
+    </section>
+    <section class="setting-card account-setting">
+      <header class="setting-header"><span class="setting-icon peach">${icon('lock')}</span><div><h2>账号设置</h2><p>登录与密码</p></div></header>
+      <div class="setting-account"><span class="avatar ${state.user.role}">${escape(state.user.name.slice(0, 1))}</span><div><strong>${escape(state.user.username)}</strong><span>${owner() ? '记录体重与留言' : '查看记录与留言'}</span></div><span class="role-badge">${owner() ? '记录者' : '查看者'}</span></div>
+      <form id="password-form"><label class="field">当前密码<input name="current" type="password" autocomplete="current-password" maxlength="128" required></label><label class="field">新密码<input name="password" type="password" autocomplete="new-password" minlength="10" maxlength="128" placeholder="至少 10 个字符" required></label><div class="error-box" role="alert"></div><button class="quiet wide" type="submit">修改密码</button></form>
+    </section>
+    <section class="setting-card export-setting">
+      <header class="setting-header"><span class="setting-icon mint">${icon('download')}</span><div><h2>数据导出</h2><p>保存到自己的设备</p></div></header>
+      <button class="export-option" data-action="export"><span class="file-icon">CSV</span><span><strong>体重记录</strong><small>日期、体重、备注</small></span>${icon('chevron')}</button>
+      ${owner() ? `<button class="export-option" data-action="backup"><span class="file-icon json">JSON</span><span><strong>完整数据</strong><small>计划、记录、全部留言</small></span>${icon('chevron')}</button>` : ''}
+      <div class="data-retention"><span class="retention-mark">${icon('check')}</span><div><strong>记录与留言不会自动过期</strong><span>登录状态过期后，重新登录即可</span></div></div>
+    </section>
   </div>`;
 }
 
@@ -245,7 +327,7 @@ function renderAuth(setup) {
 function editRecord(day) {
   if (!owner()) return;
   const r = recordFor(day), dialog = $('#record-dialog');
-  dialog.innerHTML = `<div class="dialog-head"><h2 id="record-title">${r ? '修改记录' : '记录体重'}</h2><button type="button" class="close" data-action="close-dialog" aria-label="关闭">×</button></div><form id="edit-form" data-original-day="${day}" data-version="${r?.version ?? 0}"><label class="field">日期<input name="day" type="date" value="${day}" min="${state.plan.start_date}" max="${state.today < endDate() ? state.today : endDate()}" ${r ? 'readonly' : ''} required></label><label class="field">体重 <span class="optional">kg</span><input name="weight" type="number" min="1" max="500" step="0.01" inputmode="decimal" value="${r?.weight ?? ''}" required autofocus></label><label class="field">备注<textarea name="note" maxlength="500" rows="3" placeholder="选填">${escape(r?.note || '')}</textarea></label><div class="error-box" role="alert"></div><div class="button-row">${r ? '<button type="button" class="text-link danger" data-action="delete-record">删除记录</button>' : '<span></span>'}<button class="primary" type="submit">保存</button></div></form>`;
+  dialog.innerHTML = `<div class="dialog-head"><h2 id="record-title">${r ? '修改记录' : '记录体重'}</h2><button type="button" class="close" data-action="close-dialog" aria-label="关闭">×</button></div><form id="edit-form" data-original-day="${day}" data-version="${r?.version ?? 0}"><label class="field">日期<input name="day" type="date" value="${day}" min="${state.plan.start_date}" max="${state.today < endDate() ? state.today : endDate()}" ${r ? 'readonly' : ''} required></label><label class="field">体重 <span class="optional">斤</span><input name="weight" type="number" min="1" max="500" step="0.01" inputmode="decimal" value="${r?.weight ?? ''}" required autofocus></label><label class="field">备注<textarea name="note" maxlength="500" rows="3" placeholder="选填">${escape(r?.note || '')}</textarea></label><div class="error-box" role="alert"></div><div class="button-row">${r ? '<button type="button" class="text-link danger" data-action="delete-record">删除记录</button>' : '<span></span>'}<button class="primary" type="submit">保存</button></div></form>`;
   dialog.showModal();
 }
 
@@ -254,13 +336,13 @@ async function saveRecord(day, weight, note, version) {
     const record = { day, weight, note, version: version + 1 };
     state.records = [...state.records.filter(r => r.day !== day), record].sort((a, b) => a.day.localeCompare(b.day)); resetDraft(); render(); return;
   }
-  await api('/api/records/' + day, 'PUT', { weight, note, version }); await refresh(true);
+  await api('/api/records/' + day, 'PUT', { weight, note, version }); todayDirty = false; await refresh(true);
 }
 function downloadDemo(kind) {
   let text, mime, filename;
   if (kind === 'export') {
-    text = '\ufeff日期,体重(kg),备注\r\n' + state.records.map(r => [r.day, r.weight, '"' + r.note.replaceAll('"', '""') + '"'].join(',')).join('\r\n'); mime = 'text/csv;charset=utf-8'; filename = 'demo-records.csv';
-  } else { text = JSON.stringify({ demo: true, ...state }, null, 2); mime = 'application/json'; filename = 'demo-backup.json'; }
+    text = '\ufeff日期,体重(斤),备注\r\n' + state.records.map(r => [r.day, r.weight, '"' + r.note.replaceAll('"', '""') + '"'].join(',')).join('\r\n'); mime = 'text/csv;charset=utf-8'; filename = 'demo-records.csv';
+  } else { text = JSON.stringify({ demo: true, weight_unit: 'jin', ...state }, null, 2); mime = 'application/json'; filename = 'demo-backup.json'; }
   const url = URL.createObjectURL(new Blob([text], { type: mime })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = filename; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 document.addEventListener('click', async event => {
@@ -271,6 +353,7 @@ document.addEventListener('click', async event => {
   else if (button.dataset.edit) editRecord(button.dataset.edit);
   else if (action === 'close-dialog') $('#record-dialog').close();
   else if (action === 'reload') load();
+  else if (action === 'older-messages') await olderMessages();
   else if (action === 'new-record') {
     if (state.today < state.plan.start_date) toast('计划未开始');
     else editRecord(state.today < endDate() ? state.today : endDate());
@@ -294,7 +377,8 @@ document.addEventListener('click', async event => {
   }
 });
 document.addEventListener('input', event => {
-  if (event.target.closest('#today-form')) draft[event.target.name] = event.target.value;
+  if (event.target.closest('#today-form')) { draft[event.target.name] = event.target.value; todayDirty = true; }
+  if (event.target.id === 'comment-text') messageDraft = event.target.value;
 });
 document.addEventListener('change', event => {
   if (event.target.id === 'record-month') { recordMonth = event.target.value; $('#records-table').innerHTML = recordRows(); }
@@ -316,15 +400,20 @@ document.addEventListener('submit', async event => {
       case 'edit-form': await saveRecord(values.day, Number(values.weight), values.note, Number(form.dataset.version)); $('#record-dialog').close(); toast(demo ? '演示记录已更新，不会保存到服务器' : '记录已保存'); break;
       case 'comment-form':
         if (!values.text.trim()) throw new Error('请输入留言');
-        if (demo) { state.comments.push({ id: Date.now(), user_id: 1, name: state.user.name, role: state.user.role, text: values.text.trim(), created_at: state.today + 'T12:00:00+08:00' }); render(); }
-        else { await api('/api/comments', 'POST', values); await refresh(true); }
-        if ($('#message-list')) $('#message-list').scrollTop = $('#message-list').scrollHeight;
-        toast(demo ? '演示留言已添加，刷新页面会恢复' : '已发送'); break;
+        if (demo) {
+          state.comments.push({ id: Date.now(), user_id: state.user.id, name: state.user.name, role: state.user.role, text: values.text.trim(), created_at: state.today + 'T12:00:00+08:00' });
+        } else { await api('/api/comments', 'POST', values); }
+        messageDraft = '';
+        $('#comment-text').value = '';
+        if (!demo) await refresh(true);
+        updateChat(true);
+        break;
       case 'plan-form':
-        const plan = { start_date: values.start_date, goal_weight: values.goal_weight === '' ? null : Number(values.goal_weight), version: state.plan.version };
+      case 'goal-form':
+        const plan = { start_date: values.start_date ?? state.plan.start_date, goal_weight: form.id === 'goal-form' ? (values.goal_weight === '' ? null : Number(values.goal_weight)) : state.plan.goal_weight, version: Number(form.dataset.version) };
         if (demo) { state.plan = { ...state.plan, ...plan }; render(); }
         else { await api('/api/plan', 'PUT', plan); await refresh(true); }
-        toast(demo ? '演示计划已更新，不会保存' : '计划已保存'); break;
+        toast(demo ? '演示设置已更新，不会保存' : '已保存'); break;
       case 'password-form':
         if (demo) throw new Error('演示模式无法修改密码');
         await api('/api/password', 'POST', values); form.reset(); toast('密码已更新，其他设备需要重新登录'); break;
@@ -333,5 +422,12 @@ document.addEventListener('submit', async event => {
   finally { if (submit) submit.disabled = false; }
 });
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
-setInterval(() => refresh(), 15000);
+document.addEventListener('keydown', event => {
+  if (event.target.id === 'comment-text' && event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+    event.preventDefault();
+    const form = event.target.form;
+    if (!form.querySelector('button[type="submit"]').disabled) form.requestSubmit();
+  }
+});
+setInterval(() => refresh(), 4000);
 load();

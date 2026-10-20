@@ -15,7 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parent
 
@@ -123,12 +123,23 @@ def valid_weight(value, optional=False):
     if optional and value in (None, ''):
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 1 <= value <= 500:
-        raise APIError(400, '请输入 1～500 kg 之间的体重')
+        raise APIError(400, '请输入 1～500 斤 之间的体重')
     return round(value, 2)
 
 
 def read_plan(db):
-    return json.loads(db.execute('SELECT value FROM settings WHERE id=1').fetchone()[0])
+    plan = json.loads(db.execute('SELECT value FROM settings WHERE id=1').fetchone()[0])
+    # Historical numbers were entered in jin; keep them unchanged.
+    plan.setdefault('weight_unit', 'jin')
+    return plan
+
+
+def read_comments(db, before=None):
+    condition = 'WHERE comments.id<?' if before is not None else ''
+    rows = [dict(row) for row in db.execute(f'''SELECT comments.id,text,created_at,users.name,users.role,
+        users.id AS user_id FROM comments JOIN users ON users.id=comments.user_id
+        {condition} ORDER BY comments.id DESC LIMIT 101''', (before,) if before is not None else ())]
+    return {'comments': rows[:100][::-1], 'has_more': len(rows) > 100}
 
 
 def make_backup(destination=None):
@@ -311,7 +322,7 @@ class Handler(BaseHTTPRequestHandler):
                     name = text_field(payload.get(prefix + '_name', default_name), 24, '昵称', True)
                     db.execute('INSERT INTO users(username,name,password,role) VALUES(?,?,?,?)', (username, name, hash_password(password), role))
                 start = valid_day(payload.get('start_date', '2026-10-19'))
-                plan = {'start_date': start.isoformat(), 'days': 100, 'goal_weight': None, 'version': 1}
+                plan = {'start_date': start.isoformat(), 'days': 100, 'goal_weight': None, 'weight_unit': 'jin', 'version': 1}
                 db.execute('INSERT INTO settings VALUES(1,?)', (json.dumps(plan),))
                 user_id = db.execute("SELECT id FROM users WHERE role='owner'").fetchone()[0]
             else:
@@ -330,12 +341,16 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {'ok': True}, 'application/json; charset=utf-8', cookie
         user = self.session(db, mutate=method != 'GET')
         if path == '/api/state' and method == 'GET':
-            comments = [dict(row) for row in db.execute('''SELECT comments.id,text,created_at,users.name,users.role,
-                users.id AS user_id FROM comments JOIN users ON users.id=comments.user_id ORDER BY comments.id DESC LIMIT 100''')]
+            history = read_comments(db)
             return 200, {'user': {k: user[k] for k in ('id', 'username', 'name', 'role')}, 'csrf': user['csrf'],
                          'plan': read_plan(db), 'today': today().isoformat(),
                          'records': [dict(row) for row in db.execute('SELECT * FROM records ORDER BY day')],
-                         'comments': comments[::-1]}
+                         'comments': history['comments'], 'comments_has_more': history['has_more']}
+        if path == '/api/comments' and method == 'GET':
+            raw = parse_qs(urlsplit(self.path).query).get('before', [''])[0]
+            if raw and (not re.fullmatch(r'[0-9]{1,18}', raw) or int(raw) < 1):
+                raise APIError(400, '留言游标无效')
+            return 200, read_comments(db, int(raw) if raw else None)
         if path == '/api/logout' and method == 'POST':
             db.execute('DELETE FROM sessions WHERE token=?', (user['token'],))
             return 200, {'ok': True}, 'application/json; charset=utf-8', 'journal_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0' + ('; Secure' if COOKIE_SECURE else '')
@@ -402,7 +417,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/export.csv' and method == 'GET':
             stream = io.StringIO(newline='')
             writer = csv.writer(stream)
-            writer.writerow(['日期', '体重(kg)', '备注'])
+            writer.writerow(['日期', '体重(斤)', '备注'])
             records = {r['day']: dict(r) for r in db.execute('SELECT * FROM records')}
             plan = read_plan(db)
             for i in range(plan['days']):
@@ -415,7 +430,7 @@ class Handler(BaseHTTPRequestHandler):
             return 200, ('\ufeff' + stream.getvalue()).encode(), 'text/csv; charset=utf-8', None, 'weight-journal.csv'
         if path == '/api/backup.json' and method == 'GET':
             self.session(db, owner=True)
-            data = {'schema': 1, 'exported_at': now(), 'plan': read_plan(db),
+            data = {'schema': 2, 'weight_unit': 'jin', 'exported_at': now(), 'plan': read_plan(db),
                     'records': [dict(r) for r in db.execute('SELECT * FROM records ORDER BY day')],
                     'comments': [dict(r) for r in db.execute('SELECT text,created_at,name,role FROM comments JOIN users ON users.id=comments.user_id ORDER BY comments.id')]}
             return 200, json.dumps(data, ensure_ascii=False).encode(), 'application/json; charset=utf-8', None, 'weight-journal-backup.json'

@@ -113,6 +113,62 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.viewer.request('/api/comments', 'POST', {'text': ''})[0], 400)
         self.assertEqual(self.viewer.request('/api/comments', 'POST', {'text': 'x' * 501})[0], 400)
 
+    def test_chat_history_pagination_and_access(self):
+        with server.connect() as db:
+            viewer_id = db.execute("SELECT id FROM users WHERE role='viewer'").fetchone()[0]
+            db.executemany('INSERT INTO comments(user_id,text,created_at) VALUES(?,?,?)',
+                           [(viewer_id, f'message {i}', server.now()) for i in range(205)])
+        state = self.owner.sync()[1]
+        self.assertEqual([c['id'] for c in state['comments']], list(range(106, 206)))
+        self.assertTrue(state['comments_has_more'])
+        code, older, _ = self.viewer.request('/api/comments?before=106')
+        self.assertEqual(code, 200)
+        self.assertEqual([c['id'] for c in older['comments']], list(range(6, 106)))
+        self.assertTrue(older['has_more'])
+        oldest = self.viewer.request('/api/comments?before=6')[1]
+        self.assertEqual([c['id'] for c in oldest['comments']], list(range(1, 6)))
+        self.assertFalse(oldest['has_more'])
+        self.assertEqual(Client(self.base).request('/api/comments')[0], 401)
+        for cursor in ['0', '-1', 'abc', '999999999999999999999']:
+            self.assertEqual(self.owner.request('/api/comments?before=' + cursor)[0], 400)
+        self.assertEqual(len(self.owner.request('/api/backup.json')[1]['comments']), 205)
+
+    def test_jin_labels_preserve_historical_numbers(self):
+        self.assertEqual(self.save(weight=166.6)[0], 200)
+        with server.connect() as db:
+            plan = server.read_plan(db)
+            plan.pop('weight_unit')
+            plan['goal_weight'] = 150
+            db.execute('UPDATE settings SET value=? WHERE id=1', (json.dumps(plan),))
+        state = self.owner.sync()[1]
+        self.assertEqual(state['plan']['weight_unit'], 'jin')
+        self.assertEqual(state['plan']['goal_weight'], 150)
+        self.assertEqual(state['records'][0]['weight'], 166.6)
+        rows = list(csv.reader(io.StringIO(self.owner.request('/api/export.csv')[1].decode('utf-8-sig'))))
+        self.assertEqual(rows[0][1], '体重(斤)')
+        self.assertEqual(float(rows[3][1]), 166.6)
+        backup = self.owner.request('/api/backup.json')[1]
+        self.assertEqual(backup['weight_unit'], 'jin')
+        self.assertEqual(backup['records'][0]['weight'], 166.6)
+        self.assertIn('斤', self.save(weight=501, version=1)[1]['error'])
+
+    def test_expired_session_and_finished_plan_keep_data(self):
+        self.save(weight=166.6)
+        self.viewer.request('/api/comments', 'POST', {'text': 'persistent message'})
+        actual_today = server.today
+        try:
+            server.today = lambda: actual_today() + timedelta(days=110)
+            self.assertEqual(self.owner.sync()[1]['records'][0]['weight'], 166.6)
+            self.assertEqual(self.owner.sync()[1]['comments'][0]['text'], 'persistent message')
+            with server.connect() as db:
+                db.execute('UPDATE sessions SET expires=0')
+            self.assertEqual(self.owner.sync()[0], 401)
+            self.assertEqual(self.owner.request('/api/login', 'POST', {'username': 'recorder', 'password': ' secure owner password '})[0], 200)
+            self.assertEqual(self.owner.sync()[1]['records'][0]['weight'], 166.6)
+            self.assertEqual(self.owner.sync()[1]['comments'][0]['text'], 'persistent message')
+        finally:
+            server.today = actual_today
+
     def test_record_conflict_and_delete(self):
         self.assertEqual(self.save()[0], 200)
         self.assertEqual(self.save(weight=80)[0], 409)
@@ -150,7 +206,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(code, 200)
         rows = list(csv.reader(io.StringIO(raw.decode('utf-8-sig'))))
         self.assertEqual(len(rows), 101)
-        self.assertEqual(rows[0], ['日期', '体重(kg)', '备注'])
+        self.assertEqual(rows[0], ['日期', '体重(斤)', '备注'])
         self.assertTrue(rows[3][2].startswith("'="))
         self.assertEqual(rows[4][1], '')
         self.assertIn('attachment', headers['Content-Disposition'])
