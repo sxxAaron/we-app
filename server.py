@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS records (
 CREATE TABLE IF NOT EXISTS comments (
  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
  text TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS comment_reads (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id), last_read_id INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS comments_sender_id ON comments(user_id,id);
 CREATE TABLE IF NOT EXISTS attempts (ip TEXT NOT NULL, at INTEGER NOT NULL);
 '''
 
@@ -162,6 +165,15 @@ def read_comments(db, before=None):
         users.id AS user_id FROM comments JOIN users ON users.id=comments.user_id
         {condition} ORDER BY comments.id DESC LIMIT 101''', (before,) if before is not None else ())]
     return {'comments': rows[:100][::-1], 'has_more': len(rows) > 100}
+
+
+def chat_status(db, user_id):
+    own = db.execute('SELECT last_read_id FROM comment_reads WHERE user_id=?', (user_id,)).fetchone()
+    last_read_id = own[0] if own else 0
+    partner = db.execute('''SELECT MIN(COALESCE(comment_reads.last_read_id,0)) FROM users
+        LEFT JOIN comment_reads ON users.id=comment_reads.user_id WHERE users.id!=?''', (user_id,)).fetchone()[0] or 0
+    unread = db.execute('SELECT COUNT(*) FROM comments WHERE user_id!=? AND id>?', (user_id, last_read_id)).fetchone()[0]
+    return {'unread_count': unread, 'last_read_id': last_read_id, 'partner_last_read_id': partner}
 
 
 def make_backup(destination=None):
@@ -369,12 +381,24 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {'user': {k: user[k] for k in ('id', 'username', 'name', 'role')}, 'csrf': user['csrf'],
                          'plan': read_plan(db), 'today': today().isoformat(),
                          'records': [dict(row) for row in db.execute('SELECT * FROM records ORDER BY day')],
-                         'comments': history['comments'], 'comments_has_more': history['has_more']}
+                         'comments': history['comments'], 'comments_has_more': history['has_more'],
+                         'chat': chat_status(db, user['id'])}
         if path == '/api/comments' and method == 'GET':
             raw = parse_qs(urlsplit(self.path).query).get('before', [''])[0]
             if raw and (not re.fullmatch(r'[0-9]{1,18}', raw) or int(raw) < 1):
                 raise APIError(400, '留言游标无效')
             return 200, read_comments(db, int(raw) if raw else None)
+        if path == '/api/comments/read' and method == 'POST':
+            last_read_id = self.body().get('last_read_id')
+            if type(last_read_id) is not int or not 0 <= last_read_id <= 9223372036854775807:
+                raise APIError(400, '已读位置无效')
+            db.execute('BEGIN IMMEDIATE')
+            if last_read_id and not db.execute('SELECT 1 FROM comments WHERE id=?', (last_read_id,)).fetchone():
+                raise APIError(400, '留言不存在，请刷新后重试')
+            db.execute('''INSERT INTO comment_reads(user_id,last_read_id) VALUES(?,?)
+                ON CONFLICT(user_id) DO UPDATE SET last_read_id=MAX(last_read_id,excluded.last_read_id)''',
+                       (user['id'], last_read_id))
+            return 200, {'ok': True, 'chat': chat_status(db, user['id'])}
         if path == '/api/logout' and method == 'POST':
             db.execute('DELETE FROM sessions WHERE token=?', (user['token'],))
             return 200, {'ok': True}, 'application/json; charset=utf-8', 'journal_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0' + ('; Secure' if COOKIE_SECURE else '')

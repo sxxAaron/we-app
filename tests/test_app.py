@@ -104,6 +104,65 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.viewer.request('/api/backup.json')[0], 403)
         self.assertEqual(self.viewer.request('/api/export.csv')[0], 200)
 
+    def seed_chat(self, user_ids):
+        with server.connect() as db:
+            for user_id in user_ids:
+                db.execute('INSERT INTO comments(user_id,text,created_at) VALUES(?,?,?)',
+                           (user_id, 'isolated test message', server.now()))
+
+    def test_unread_counts_only_partner_and_state_fetch_does_not_read(self):
+        self.seed_chat([1, 2, 2])
+        for _ in range(2):
+            owner = self.owner.sync()[1]
+            viewer = self.viewer.sync()[1]
+            self.assertEqual(owner['chat'], {'unread_count': 2, 'last_read_id': 0, 'partner_last_read_id': 0})
+            self.assertEqual(viewer['chat']['unread_count'], 1)
+        self.assertEqual(self.owner.request('/api/comments')[0], 200)
+        self.assertEqual(self.owner.sync()[1]['chat']['unread_count'], 2)
+
+    def test_read_cursor_is_per_user_persistent_and_monotonic(self):
+        self.seed_chat([1, 2, 2])
+        status, result, _ = self.viewer.request('/api/comments/read', 'POST', {'last_read_id': 1, 'user_id': 1})
+        self.assertEqual(status, 200)
+        self.assertEqual(result['chat']['unread_count'], 0)
+        self.assertEqual(self.owner.sync()[1]['chat']['partner_last_read_id'], 1)
+        self.assertEqual(self.owner.sync()[1]['chat']['last_read_id'], 0)
+        self.assertEqual(self.owner.request('/api/comments/read', 'POST', {'last_read_id': 3})[0], 200)
+        self.owner.request('/api/comments/read', 'POST', {'last_read_id': 1})
+        server.initialize()  # Startup migrations are repeatable and preserve receipts.
+        self.assertEqual(self.owner.sync()[1]['chat']['last_read_id'], 3)
+        self.assertEqual(self.viewer.sync()[1]['chat']['partner_last_read_id'], 3)
+        self.assertEqual(self.owner.sync()[1]['chat']['unread_count'], 0)
+
+    def test_read_old_snapshot_does_not_consume_newer_message(self):
+        self.seed_chat([2, 1])
+        shown_id = self.owner.sync()[1]['comments'][-1]['id']
+        self.seed_chat([2])
+        status, result, _ = self.owner.request('/api/comments/read', 'POST', {'last_read_id': shown_id})
+        self.assertEqual(status, 200)
+        self.assertEqual(result['chat']['unread_count'], 1)
+        self.assertEqual(result['chat']['last_read_id'], 2)
+
+    def test_read_requires_login_csrf_and_valid_existing_integer_cursor(self):
+        outsider = Client(self.base)
+        self.seed_chat([2])
+        self.assertEqual(outsider.request('/api/comments/read', 'POST', {'last_read_id': 1})[0], 401)
+        self.assertEqual(self.owner.request('/api/comments/read', 'POST', {'last_read_id': 1}, csrf=False)[0], 403)
+        for value in [-1, 2, True, '1', 1.5, None, 2**80]:
+            self.assertEqual(self.owner.request('/api/comments/read', 'POST', {'last_read_id': value})[0], 400)
+        self.assertEqual(self.owner.sync()[1]['chat']['last_read_id'], 0)
+
+    def test_unread_counts_all_history_beyond_one_page_and_backup_preserves_it(self):
+        self.seed_chat([2] * 205 + [1])
+        state = self.owner.sync()[1]
+        self.assertEqual(len(state['comments']), 100)
+        self.assertEqual(state['chat']['unread_count'], 205)
+        self.owner.request('/api/comments/read', 'POST', {'last_read_id': 150})
+        backup = server.make_backup(Path(self.temp.name) / 'receipt-backup.db')
+        with sqlite3.connect(backup) as db:
+            self.assertEqual(db.execute('SELECT last_read_id FROM comment_reads WHERE user_id=1').fetchone()[0], 150)
+        self.assertEqual(self.owner.sync()[1]['chat']['unread_count'], 55)
+
     def test_comments_shared_and_plain_text(self):
         comment = '<script>alert(1)</script> 加油🌿'
         self.assertEqual(self.viewer.request('/api/comments', 'POST', {'text': comment})[0], 200)

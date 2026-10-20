@@ -14,7 +14,7 @@ function app() {
   const events = new Map();
   const context = vm.createContext({
     URLSearchParams, console, Map, JSON, Date, setTimeout: () => 0, clearTimeout() {}, setInterval() {},
-    document: { querySelector: s => nodes.get(s) || null, addEventListener: (name, callback) => events.set(name, callback), activeElement: { tagName: 'BODY' }, hidden: false },
+    document: { querySelector: s => nodes.get(s) || null, querySelectorAll: () => [], addEventListener: (name, callback) => events.set(name, callback), activeElement: { tagName: 'BODY' }, hidden: false },
     location: { search: '' }, window: { scrollTo() {} },
     FormData: class { constructor(form) { return new Map(Object.entries(form.values)); } },
     fetch: async () => { throw Error('Unexpected real network request'); }
@@ -218,4 +218,98 @@ test('latest editor refreshes the server date first and stays closed when sync f
   a.run("api=async()=>{throw new Error('offline')};");
   await a.run('openLatestWeight()');
   assert.equal(dialog.open,false);
+});
+
+test('unread badges appear on both navigations, cap at 99+, hide zero and label full counts', () => {
+  const a = app();
+  const badge = {}, button = { setAttribute(name, value) { this[name] = value; } };
+  a.context.document.querySelectorAll = selector => selector === '[data-unread-badge]' ? [badge] : [button];
+  for (const nav of ['nav()', "nav('bottom-nav')"]) assert.match(a.run(nav), /data-unread-badge[^>]*>2<\/span>/);
+  a.run('state.chat.unread_count=123; updateUnreadBadge()');
+  assert.equal(badge.textContent, '99+'); assert.equal(badge.hidden, false);
+  assert.equal(button['aria-label'], '留言，123 条未读');
+  assert.equal(a.context.document.title, '(123) we.app · 体重记录');
+  a.run('state.chat.unread_count=0; updateUnreadBadge()');
+  assert.equal(badge.hidden, true);
+  assert.equal(a.context.document.title, 'we.app · 体重记录');
+});
+test('only own messages show receipts, including older loaded messages', () => {
+  const a = app();
+  assert.equal((a.run('chatHistory()').match(/read-receipt/g)||[]).length, 1);
+  assert.match(a.run('chatHistory()'), /read-receipt ">未读/);
+  a.run('state.chat.partner_last_read_id=2');
+  assert.match(a.run('chatHistory()'), /read-receipt is-read">已读/);
+});
+test('home, hidden chat, a dialog and scrolled history do not acknowledge unread messages', async () => {
+  const a = app();
+  a.log.scrollTop = 500;
+  for (const prepare of ["screen='overview'", "screen='messages'; document.hidden=true", "document.hidden=false; $('#record-dialog').open=true", "$('#record-dialog').open=false; $('#message-list').scrollTop=100"]) {
+    a.run(prepare);
+    await a.run('markMessagesRead()');
+    assert.equal(a.run('state.chat.unread_count'), 2);
+    assert.equal(a.run('state.chat.last_read_id'), 0);
+  }
+});
+test('viewing the latest chat acknowledges once, preserves draft and uses displayed cursor', async () => {
+  const a = app();
+  a.log.scrollTop = 500;
+  a.text.value = 'keep unsent';
+  a.run("screen='messages'; demo=false; calls=[]; api=async (...args)=>{calls.push(args);return {chat:{...state.chat,last_read_id:3,unread_count:0}}};");
+  await a.run('markMessagesRead()');
+  await a.run('markMessagesRead()');
+  assert.equal(a.run('calls.length'), 1);
+  assert.equal(a.run('calls[0][0]'), '/api/comments/read');
+  assert.equal(a.run('calls[0][2].last_read_id'), 3);
+  assert.equal(a.run('state.chat.unread_count'), 0);
+  assert.equal(a.text.value, 'keep unsent');
+});
+test('failed acknowledgements retain unread count and are retryable', async () => {
+  const a = app();
+  a.log.scrollTop = 500;
+  a.run("screen='messages'; demo=false; api=async()=>{throw Error('offline')}");
+  await a.run('markMessagesRead()');
+  assert.equal(a.run('state.chat.unread_count'), 2);
+  assert.equal(a.run('markingRead'), false);
+  a.run("api=async()=>({chat:{...state.chat,last_read_id:3,unread_count:0}})");
+  await a.run('markMessagesRead()');
+  assert.equal(a.run('state.chat.unread_count'), 0);
+});
+test('polling updates badges on home without replacing the page or marking read', async () => {
+  const a = app();
+  const badge = {};
+  a.context.document.querySelectorAll = selector => selector === '[data-unread-badge]' ? [badge] : [];
+  a.root.innerHTML = 'keep home';
+  a.run("demo=false; calls=[]; api=async (...args)=>{calls.push(args);return {...state,chat:{...state.chat,unread_count:4}}};");
+  await a.run('refresh()');
+  assert.equal(a.root.innerHTML, 'keep home');
+  assert.equal(badge.textContent, '4');
+  assert.equal(a.run('calls.length'), 1);
+  assert.equal(a.run('state.chat.last_read_id'), 0);
+});
+test('partner read receipts refresh on chat without new messages or losing input', async () => {
+  const a = app();
+  a.text.value = 'still typing';
+  a.run("screen='messages';demo=false;api=async()=>({...state,chat:{...state.chat,partner_last_read_id:2}})");
+  await a.run('refresh(true)');
+  assert.match(a.log.innerHTML, /read-receipt is-read">已读/);
+  assert.equal(a.text.value, 'still typing');
+});
+test('entering chat and scrolling to the latest message clears the demo badge', async () => {
+  const a = app();
+  a.context.document.querySelector = selector => selector === '#message-list' && !a.root.innerHTML.includes('id="message-list"') ? null : (a.nodes.get(selector) || null);
+  await a.events.get('click')({target:{closest:()=>({dataset:{screen:'messages'}})}});
+  assert.equal(a.run('state.chat.unread_count'), 0);
+  assert.equal(a.run('state.chat.last_read_id'), 3);
+});
+test('overlapping read acknowledgements use a single request', async () => {
+  const a = app();
+  a.log.scrollTop = 500;
+  a.run("screen='messages';demo=false;calls=0;api=()=>{calls++;return new Promise(resolve=>{finishRead=resolve})}");
+  const pending = a.run('markMessagesRead()');
+  await a.run('markMessagesRead()');
+  assert.equal(a.run('calls'), 1);
+  a.run('finishRead({chat:{...state.chat,last_read_id:3,unread_count:0}})');
+  await pending;
+  assert.equal(a.run('markingRead'), false);
+  assert.equal(a.run('state.chat.unread_count'), 0);
 });

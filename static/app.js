@@ -4,7 +4,8 @@ const root = $('#app');
 let state, screen = 'overview', range = 0, demo = new URLSearchParams(location.search).get('demo') === '1';
 let calendarMonth = '', selectedRecordDay = '', toastTimer, lastSync = '', refreshing = false;
 let settingsSection = '';
-let messageDraft = '', chatHasMore = false, chatLoading = false, lastPoll = 0;
+let messageDraft = '', chatHasMore = false, chatLoading = false;
+let markingRead = false;
 const icons = {
   overview: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
   messages: '<path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H4l-2 2V11.5a9.5 9.5 0 1 1 19 0Z"/><path d="M7 11h10m-10 4h6"/>',
@@ -72,16 +73,14 @@ async function load() {
   }
 }
 async function refresh(force = false) {
-  if (demo || !state || refreshing) return false;
+  if (demo || !state || refreshing || markingRead) return false;
   const editing = /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
   if (!force && (document.hidden || $('#record-dialog').open || (editing && !document.activeElement.closest('#comment-form')))) return;
-  if (!force && screen !== 'messages' && Date.now() - lastPoll < 15000) return;
   refreshing = true;
-  lastPoll = Date.now();
   try {
     const next = await api('/api/state');
     const changed = JSON.stringify([state.records, state.plan, state.today]) !== JSON.stringify([next.records, next.plan, next.today]);
-    const messagesChanged = JSON.stringify(state.comments.slice(-100)) !== JSON.stringify(next.comments);
+    const messagesChanged = JSON.stringify([state.comments.slice(-100), state.chat]) !== JSON.stringify([next.comments, next.chat]);
     const hadOlder = state.comments.length > next.comments.length;
     next.comments = [...new Map([...state.comments, ...next.comments].map(c => [c.id, c])).values()].sort((a, b) => a.id - b.id);
     if (!hadOlder) chatHasMore = !!next.comments_has_more;
@@ -89,6 +88,8 @@ async function refresh(force = false) {
     lastSync = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
     if (screen === 'messages') { if (messagesChanged || force) updateChat(); }
     else if (force || (changed && screen !== 'settings')) render();
+    updateUnreadBadge();
+    await markMessagesRead();
     syncLabel();
     return true;
   } catch (error) {
@@ -101,15 +102,47 @@ async function refresh(force = false) {
 function demoState() {
   const weights = [164.8, 164.4, 164.6, 163.8, 164.0, 163.4, 163.6, 163.2, 163.0, 163.4, 162.6, 162.4];
   const notes = ['早晨空腹测量', '', '散步 30 分钟', '', '', '', '', '', '', '晚餐火锅', '散步 40 分钟', '早晨空腹测量'];
-  return { user: { id: 1, username: 'demo', name: '记录者', role: 'owner' }, today: '2026-10-30', plan: { start_date: '2026-10-19', days: 100, goal_weight: 152, weight_unit: 'jin', version: 1 }, records: weights.map((weight, i) => ({ day: dayAdd('2026-10-19', i), weight, note: notes[i], version: 1 })), comments: [{ id: 1, user_id: 2, name: '查看者', role: 'viewer', text: '明天早上记得称一下。', created_at: '2026-10-29T20:36:00+08:00' }, { id: 2, user_id: 1, name: '记录者', role: 'owner', text: '好，明早记录。', created_at: '2026-10-29T21:04:00+08:00' }, { id: 3, user_id: 2, name: '查看者', role: 'viewer', text: '晚上去散步？', created_at: '2026-10-30T09:18:00+08:00' }] };
+  return { chat: { unread_count: 2, last_read_id: 0, partner_last_read_id: 1 }, user: { id: 1, username: 'demo', name: '记录者', role: 'owner' }, today: '2026-10-30', plan: { start_date: '2026-10-19', days: 100, goal_weight: 152, weight_unit: 'jin', version: 1 }, records: weights.map((weight, i) => ({ day: dayAdd('2026-10-19', i), weight, note: notes[i], version: 1 })), comments: [{ id: 1, user_id: 2, name: '查看者', role: 'viewer', text: '明天早上记得称一下。', created_at: '2026-10-29T20:36:00+08:00' }, { id: 2, user_id: 1, name: '记录者', role: 'owner', text: '好，明早记录。', created_at: '2026-10-29T21:04:00+08:00' }, { id: 3, user_id: 2, name: '查看者', role: 'viewer', text: '晚上去散步？', created_at: '2026-10-30T09:18:00+08:00' }] };
 }
 function nav(extra = '') {
   const tabs = [['overview', '首页'], ['messages', '留言'], ['settings', '设置']];
   const selected = screen === 'records' ? 'overview' : screen;
   return `<nav class="${extra || 'nav'}" aria-label="主导航">${tabs.map(([key, label]) => `
     <button type="button" data-screen="${key}" class="${selected === key ? 'active' : ''}" ${selected === key ? 'aria-current="page"' : ''}>
-      ${icon(key)}<span>${label}</span>
+      <span class="nav-icon">${icon(key)}${key === 'messages' ? `<span class="unread-badge" data-unread-badge aria-hidden="true" ${unreadCount() ? '' : 'hidden'}>${badgeText()}</span>` : ''}</span><span>${label}</span>
     </button>`).join('')}</nav>`;
+}
+
+function unreadCount() { return state?.chat?.unread_count || 0; }
+function badgeText() { return unreadCount() > 99 ? '99+' : String(unreadCount()); }
+function updateUnreadBadge() {
+  for (const badge of document.querySelectorAll('[data-unread-badge]')) {
+    badge.textContent = badgeText(); badge.hidden = unreadCount() === 0;
+  }
+  for (const button of document.querySelectorAll('[data-screen="messages"]')) {
+    button.setAttribute('aria-label', unreadCount() ? `留言，${unreadCount()} 条未读` : '留言');
+  }
+  document.title = `${unreadCount() ? '(' + unreadCount() + ') ' : ''}we.app · 体重记录`;
+}
+
+async function markMessagesRead() {
+  const list = $('#message-list');
+  if (!state || markingRead || screen !== 'messages' || document.hidden || $('#record-dialog').open ||
+      !list || list.clientHeight <= 0 || list.scrollHeight - list.scrollTop - list.clientHeight > 16) return;
+  const lastId = state.comments.at(-1)?.id || 0;
+  if (lastId <= (state.chat?.last_read_id || 0)) return;
+  const userId = state.user.id;
+  markingRead = true;
+  try {
+    const result = demo ? { chat: { ...state.chat, last_read_id: lastId, unread_count: 0 } } :
+      await api('/api/comments/read', 'POST', { last_read_id: lastId });
+    if (state?.user.id !== userId) return;
+    const receiptsChanged = state.chat?.partner_last_read_id !== result.chat.partner_last_read_id;
+    state.chat = result.chat;
+    updateUnreadBadge();
+    if (receiptsChanged && screen === 'messages') updateChat();
+  } catch (error) { syncLabel(true); }
+  finally { markingRead = false; }
 }
 
 function render() {
@@ -143,6 +176,7 @@ function render() {
     const list = $('#message-list');
     list.scrollTop = previousScroll == null ? list.scrollHeight : previousScroll;
   }
+  updateUnreadBadge();
 }
 
 function overview() {
@@ -213,7 +247,8 @@ function chatHistory() {
     const divider = day !== lastDay ? `<div class="chat-date"><span>${day === state.today ? '今天' : fullDate(day)}</span></div>` : '';
     lastDay = day;
     const own = c.user_id === state.user.id;
-    return `${divider}<article class="chat-message ${own ? 'own-message' : ''}"><span class="avatar ${c.role}">${escape(c.name.slice(0, 1))}</span><div class="chat-message-body"><div class="chat-author">${escape(c.name)}</div><p class="chat-bubble">${escape(c.text)}</p><time datetime="${escape(c.created_at)}">${c.created_at.slice(11, 16)}</time></div></article>`;
+    const read = c.id <= (state.chat?.partner_last_read_id || 0);
+    return `${divider}<article class="chat-message ${own ? 'own-message' : ''}"><span class="avatar ${c.role}">${escape(c.name.slice(0, 1))}</span><div class="chat-message-body"><div class="chat-author">${escape(c.name)}</div><p class="chat-bubble">${escape(c.text)}</p><div class="message-meta"><time datetime="${escape(c.created_at)}">${c.created_at.slice(11, 16)}</time>${own ? `<span class="read-receipt ${read ? 'is-read' : ''}">${read ? '已读' : '未读'}</span>` : ''}</div></div></article>`;
   }).join('') : '<div class="chat-empty">' + icon('messages') + '<span>暂无留言</span></div>'}`;
 }
 
@@ -357,6 +392,7 @@ function settingsDetail() {
 }
 
 function renderAuth(setup) {
+  document.title = 'we.app · 体重记录';
   root.innerHTML = `<main class="auth-page ${setup ? 'setup' : ''}"><div class="auth-container">${brand()}<section class="auth-card"><header><h1>${setup ? '初始化账号' : '登录'}</h1><span>体重记录</span></header>
     <form id="${setup ? 'setup-form' : 'login-form'}">${setup ? `
       <label class="field">初始化密钥<input name="token" type="password" autocomplete="off" required></label>
@@ -392,7 +428,13 @@ function downloadDemo(kind) {
 document.addEventListener('click', async event => {
   const button = event.target.closest('button'); if (!button) return;
   const action = button.dataset.action;
-  if (button.dataset.screen) { screen = button.dataset.screen; settingsSection = ''; render(); window.scrollTo({ top: 0 }); }
+  if (button.dataset.screen) {
+    screen = button.dataset.screen; settingsSection = ''; render(); window.scrollTo({ top: 0 });
+    if (screen === 'messages') {
+      if (demo) await markMessagesRead();
+      else await refresh(true);
+    }
+  }
   else if (button.dataset.setting) { settingsSection = button.dataset.setting; screen = 'settings'; render(); window.scrollTo({ top: 0 }); }
   else if (action === 'back-settings') { settingsSection = ''; render(); window.scrollTo({ top: 0 }); }
   else if (button.dataset.range) { range = Number(button.dataset.range); render(); }
@@ -469,6 +511,7 @@ document.addEventListener('submit', async event => {
         $('#comment-text').value = '';
         if (!demo) await refresh(true);
         updateChat(true);
+        await markMessagesRead();
         break;
       case 'plan-form':
       case 'goal-form':
@@ -498,7 +541,12 @@ document.addEventListener('submit', async event => {
   } catch (error) { if (errorBox) errorBox.textContent = error.message; else toast(error.message); }
   finally { if (submit) submit.disabled = false; }
 });
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+document.addEventListener('visibilitychange', async () => {
+  if (!document.hidden) { await refresh(true); if (demo) await markMessagesRead(); }
+});
+document.addEventListener('scroll', event => {
+  if (event.target.id === 'message-list') void markMessagesRead();
+}, true);
 document.addEventListener('keydown', event => {
   if (event.target.id === 'comment-text' && event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
     event.preventDefault();
